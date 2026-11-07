@@ -1,3 +1,23 @@
+> [!NOTE]
+> **mango-toq** is the `toq` engine of [Mango Code](https://github.com/Federico-Anastasi/mango-code): ik_llama.cpp (commit
+> 35e7256) plus the changes on the `mango` branch. It is the engine that runs
+> [Qwen3.8-27B-TOQ-v1](https://huggingface.co/federico-anastasi/Qwen3.8-27B-TOQ-v1), whose trellis weights stock
+> llama.cpp cannot read. Mango Code downloads it by itself; you only need this repository to build the engine or to run
+> it by hand.
+>
+> **What the `mango` branch adds**
+> - Trellis weight types (TRL2_M, TRL3_M) on CUDA, CPU (AVX2) and Vulkan.
+> - int8 tensor-core GEMM for prompt processing.
+> - Prompt processing on the main GPU, with the other GPUs' layers streamed from pinned RAM.
+> - Per-layer device map (`LLAMA_LAYER_DEVICES`), clock keeper, CUDA graphs on Pascal and Turing.
+> - Multi-token prediction (MTP).
+> - Conversations saved to disk and restored (`--cache-disk`), and cancellation while the prompt is being read.
+>
+> **Prebuilt Windows engines** (CPU, Vulkan, CUDA 12): [release `toq-35e7256`](https://github.com/Federico-Anastasi/mango-toq/releases/tag/toq-35e7256).
+> Build it yourself with `mango-ci/build.ps1 -Variant cuda-12` (or `cpu`, `vulkan`).
+>
+> License: MIT, as upstream. The original README follows.
+
 # ik_llama.cpp: llama.cpp fork with better CPU performance
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
