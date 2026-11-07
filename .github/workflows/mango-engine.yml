@@ -1,0 +1,83 @@
+name: Mango engine (Windows)
+
+# Builds the `toq` engine for Windows (CPU, Vulkan, CUDA 12) and, on a `toq-*` tag, publishes the zips
+# in a release. The build options live in mango-ci/build.ps1, the same script `launcher\setup.ps1 -Only
+# llama-toq` uses in the mango-code repo.
+# Run by hand (workflow_dispatch) it builds and uploads the zips as artifacts, without a release.
+on:
+  push:
+    tags: ["toq-*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The zips are named after the tag: toq-35e7256-win-cuda-12.zip (the app's catalog looks for this name).
+  NAME: ${{ github.ref_type == 'tag' && github.ref_name || 'toq-test' }}
+  VULKAN_VERSION: 1.4.357.0
+
+jobs:
+  build:
+    name: ${{ matrix.variant }}
+    runs-on: windows-2022
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cpu, vulkan, cuda-12]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: CUDA 12.4
+        if: matrix.variant == 'cuda-12'
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: "12.4"
+          cuda_arch: x64
+
+      - name: Vulkan SDK
+        if: matrix.variant == 'vulkan'
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Ninja
+        run: choco install ninja --no-progress -y
+
+      - name: Build
+        run: ./mango-ci/build.ps1 -Variant ${{ matrix.variant }} -Out "$env:RUNNER_TEMP\engine" -Zip "$env:GITHUB_WORKSPACE\${env:NAME}-win-${{ matrix.variant }}.zip"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.variant }}
+          path: |
+            ${{ github.workspace }}/*.zip
+            ${{ github.workspace }}/*.zip.sha256
+          if-no-files-found: error
+
+  publish:
+    name: release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          path: zip
+          merge-multiple: true
+
+      # The notes carry each zip's size and sha256, in the form mango-engines.json wants.
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd zip
+          for z in *.zip; do
+            echo "- \`$z\`: size $(stat -c %s "$z"), sha256 $(cut -d' ' -f1 "$z.sha256")"
+          done > ../notes.md
+          gh release create "$NAME" --repo "$GITHUB_REPOSITORY" --title "$NAME" --notes-file ../notes.md ./*.zip ./*.zip.sha256
