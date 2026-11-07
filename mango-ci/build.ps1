@@ -58,10 +58,11 @@ function Invoke-Native {
 }
 
 # Every DLL that the engine's files load must be in the folder, in Windows (System32 or an api-ms-/ext-ms- API set),
-# or be the CUDA runtime the app adds (cudart, cuBLAS) or the NVIDIA driver (nvcuda). It is the check for the CUDA
-# build where the driver is missing, as on the CI runner, and the engine cannot start.
+# or be what the user's PC adds: the CUDA runtime the app brings (cudart, cuBLAS), the NVIDIA driver (nvcuda) or the
+# Vulkan loader of the GPU driver (vulkan-1). Starting the engine is not enough: on the CI runner a DLL that users do
+# not have (OpenSSL, for one) can be found in the PATH.
 function Assert-Dependencies([string]$dir) {
-    $outside = '^(cudart64_12|cublas64_12|cublasLt64_12|nvcuda|api-ms-win-.+|ext-ms-.+)\.dll$'
+    $outside = '^(cudart64_12|cublas64_12|cublasLt64_12|nvcuda|vulkan-1|api-ms-win-.+|ext-ms-.+)\.dll$'
     $system = Join-Path $env:SystemRoot "System32"
     Get-ChildItem $dir -File | Where-Object { $_.Extension -in ".exe", ".dll" } | ForEach-Object {
         $file = $_.Name
@@ -109,12 +110,12 @@ if ($Zip) {
     # no BOM and LF line ending, like `sha256sum`
     [System.IO.File]::WriteAllText("$Zip.sha256", "$hash  $(Split-Path $Zip -Leaf)`n", (New-Object System.Text.UTF8Encoding($false)))
 
-    # The engine must start from the zip, not only from the folder it was built in. The CUDA build needs the
-    # NVIDIA driver to start, which the CI runner does not have: there its dependencies are checked instead.
+    # The engine must run from the zip, not only from the folder it was built in: its dependencies are checked, and
+    # it is started where it can be (the CUDA build needs the NVIDIA driver, which the CI runner does not have).
     $check = Join-Path ([IO.Path]::GetTempPath()) "mango-zip-$([guid]::NewGuid())"
     Expand-Archive $Zip $check
     try {
-        if ($Variant -eq "cuda-12") { Assert-Dependencies $check }
-        else { Invoke-Native "$check\llama-server.exe" --version }
+        Assert-Dependencies $check
+        if ($Variant -ne "cuda-12") { Invoke-Native "$check\llama-server.exe" --version }
     } finally { Remove-Item $check -Recurse -Force }
 }
