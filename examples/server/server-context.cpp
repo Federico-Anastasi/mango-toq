@@ -3,6 +3,7 @@
 #include "server-common.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "server-slot-file.h"
 
 #include "common.h"
 #include "llama.h"
@@ -522,6 +523,31 @@ void server_context::init() {
         };
     }
 
+    if (!params_base.slot_save_path.empty() || !params_base.cache_disk.empty()) {
+        model_fp = slot_file_model_fingerprint(params_base);
+    }
+    if (!params_base.cache_disk.empty()) {
+        if (!params_base.ctx_checkpoint_spill_dir.empty()) {
+            throw std::runtime_error("--cache-disk and --ctx-checkpoints-spill-dir cannot be used together");
+        }
+        if (!llama_model_supports_partial_kv_reuse(model)) {
+            throw std::runtime_error("--cache-disk: this model keeps private state outside the generic KV cache");
+        }
+        if (!params_base.speculative.model.empty()) {
+            // the draft model state is not in the files (the MTP one is: server-slot-file.h)
+            throw std::runtime_error("--cache-disk cannot be used with a draft model");
+        }
+        if (prompt_cache) {
+            LLAMA_LOG_INFO("%s", "prompt cache in RAM disabled: --cache-disk replaces it\n");
+            prompt_cache.reset();
+        }
+        disk_cache = std::make_unique<slot_disk_cache>(params_base.cache_disk, (size_t) params_base.cache_disk_mib << 20,
+                                                       (int64_t) params_base.cache_disk_hours * 3600, model_fp);
+        disk_cache->scan();
+        chat_params.cache_base = true;
+        disk_cache->restore_latest(*this, slots.front());
+        clean_kv_cache = false; // the restored state must not be erased on the first idle round
+    }
 }
 
 
@@ -549,6 +575,7 @@ void server_slot::prompt_load(server_prompt_cache& prompt_cache, const server_to
 }
 
 void server_slot::reset() {
+    disk_base_pos = -1;
     n_prompt_tokens = 0;
     last_gentxt_len = 0;
     generated_text = "";
@@ -701,6 +728,12 @@ void server_slot::release() {
         t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
         command = SLOT_COMMAND_RELEASE;
         state = SLOT_STATE_IDLE;
+        task.reset();
+    } else if (command == SLOT_COMMAND_LOAD_PROMPT) {
+        // mango-code: cancelled while reading the prompt (the client closed, the "Stop" button). Without this
+        // the cancellation did nothing and the read went on to the last token: minutes of compute
+        // for nobody, with the next conversation waiting. What has already been read stays in the cache.
+        command = SLOT_COMMAND_RELEASE;
         task.reset();
     }
     spec_target_only = false;
@@ -2490,6 +2523,18 @@ void server_context::send_error(const int id_task, const int id_multi, const std
     queue_results.send(std::move(res));
 }
 
+// The /slots tasks wait for the result in the "legacy" queue (server_response::recv): an error
+// sent with send_error() ends up in the other queue and the HTTP request would hang forever.
+void server_context::send_slot_error(const server_task & task, const std::string & error, const enum error_type type) {
+    LOG_ERROR("task error", { {"id_task", task.id}, {"error", error} });
+    server_task_result res;
+    res.id = task.id;
+    res.id_multi = task.id_multi;
+    res.error = true;
+    res.data = format_error_response(error, type);
+    queue_results.send(res);
+}
+
 // if multimodal is enabled, send an error and return false
 bool server_context::check_no_mtmd(const int id_task) {
     if (mctx) {
@@ -2916,43 +2961,6 @@ static bool load_spilled_checkpoint(server_prompt_checkpoint & ckpt) {
     return true;
 }
 
-static size_t save_server_tokens_to_file(const std::string & filename, const server_tokens & tokens) {
-    std::ofstream file(filename, std::ios::binary);
-    json token_json = tokens.to_json();
-    token_json["magic"] = LLAMA_SERVER_MAGIC;
-    token_json["version"] = LLAMA_SERVER_VERSION;
-    size_t pos = 0;
-    if (file.is_open()) {
-        file << token_json;
-        pos = file.tellp();
-        file.close();
-    }
-    return pos;
-}
-
-static size_t load_server_tokens_from_file(const std::string & filename,  server_tokens & tokens) {
-    std::ifstream file(filename, std::ios::binary);
-    if (!file.is_open()) {
-        return 0;
-    }
-    size_t pos = 0;
-    json token_json;
-    if (file.is_open()) {
-        file >> token_json;
-        pos = file.tellg();
-        file.close();
-    }
-    uint32_t magic = token_json.value<uint32_t>("magic", 0);
-    uint32_t version = token_json.value<uint32_t>("version", 0);
-    if (magic != LLAMA_SERVER_MAGIC || version != LLAMA_SERVER_VERSION) {
-        LLAMA_LOG_ERROR("%s: unknown (magic, version) for token file: %08x, %08x\n", __func__, magic, version);
-        return 0;
-    }
-    tokens.from_json(token_json);
-
-    return pos;
-}
-
 void server_context::process_single_task(server_task&& task) {
     switch (task.type) {
     case SERVER_TASK_TYPE_COMPLETION:
@@ -2999,6 +3007,9 @@ void server_context::process_single_task(server_task&& task) {
         }
 
         slot->reset();
+        if (disk_cache && task.type == SERVER_TASK_TYPE_COMPLETION) {
+            disk_cache->prepare(*this, *slot, task);
+        }
 
         slot->id_task = task.id;
         slot->id_multi = task.id_multi;
@@ -3031,12 +3042,27 @@ void server_context::process_single_task(server_task&& task) {
         int n_idle_slots = 0;
         int n_processing_slots = 0;
 
+        // lite: only the progress fields (no prompt text nor sampling parameters)
+        // /health and /metrics send the task without data (null): value() would throw there and abort the engine
+        const bool lite = json_value(task.data, "lite", false);
+
         for (server_slot& slot : slots) {
-            json slot_data = get_formatted_generation(slot);
+            json slot_data = lite ? json::object() : get_formatted_generation(slot);
             slot_data["id"] = slot.id;
             slot_data["id_task"] = slot.id_task;
             slot_data["state"] = slot.state;
-            slot_data["prompt"] = slot.prompt;
+            // progress of the prompt read (tokens); the time is the one elapsed since the read started
+            // "state" stays IDLE while the prompt is loading: is_processing() tells whether the slot is working
+            slot_data["is_processing"] = slot.is_processing();
+            slot_data["n_prompt_tokens"] = slot.n_prompt_tokens;
+            slot_data["n_past_prompt"] = slot.n_past_prompt;
+            slot_data["n_prompt_tokens_cache"] = slot.n_prompt_tokens_cache;
+            slot_data["t_prompt_ms"] = !slot.is_processing() ? 0.0
+                : slot.n_past_prompt < slot.n_prompt_tokens ? (ggml_time_us() - slot.t_start_process_prompt) / 1e3
+                : slot.t_prompt_processing;
+            if (!lite) {
+                slot_data["prompt"] = slot.prompt;
+            }
             slot_data["next_token"] = {
                 {"has_next_token", slot.has_next_token},
                 {"n_remain",       slot.n_remaining},
@@ -3105,7 +3131,7 @@ void server_context::process_single_task(server_task&& task) {
         int id_slot = task.data.at("id_slot");
         server_slot* slot = get_slot_by_id(id_slot);
         if (slot == nullptr) {
-            send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+            send_slot_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
             break;
         }
         if (!slot->available()) {
@@ -3115,32 +3141,43 @@ void server_context::process_single_task(server_task&& task) {
             break;
         }
 
-        const size_t token_count = slot->cache_tokens.size();
-        const int64_t t_start = ggml_time_us();
-
-        std::string filename = task.data.at("filename");
-        std::string filepath = task.data.at("filepath");
-        save_server_tokens_to_file(filepath+".tokens.json", slot->cache_tokens);
-        create_checkpoint(*slot);
-        size_t saved = save_checkpoints_to_file(filepath + ".checkpoints", slot->server_cached_prompt.checkpoints);
-
-        const size_t nwrite = llama_state_seq_save_file(ctx, filepath.c_str(), slot->id, slot->cache_tokens.data(), token_count);
-
-        const int64_t t_end = ggml_time_us();
-        const double t_save_ms = (t_end - t_start) / 1000.0;
-
         server_task_result result;
         result.id = task.id;
         result.error = false;
-        result.data = json{
-            { "id_slot",   id_slot },
-            { "filename",  filename },
-            { "n_saved",   token_count }, // tokens saved
-            { "n_written", nwrite + saved },      // bytes written
-            { "timings", {
-                { "save_ms", t_save_ms }
-            } }
-        };
+        if (json_value(task.data, "persist", false)) {
+            // app shutdown: the current state into the disk cache, if it is not there already
+            if (!disk_cache) {
+                send_slot_error(task, "--cache-disk is not enabled", ERROR_TYPE_NOT_SUPPORTED);
+                break;
+            }
+            const slot_file_result r = disk_cache->persist(*this, *slot);
+            if (!r.ok && !r.error.empty()) {
+                send_slot_error(task, "slot persist failed: " + r.error, ERROR_TYPE_SERVER);
+                break;
+            }
+            result.data = json{
+                { "id_slot",   id_slot },
+                { "saved",     r.ok },
+                { "n_saved",   r.n_tokens },
+                { "n_written", r.n_bytes },
+                { "timings",   { { "save_ms", r.ms } } }
+            };
+        } else {
+            const std::string filename = task.data.at("filename");
+            const std::string filepath = task.data.at("filepath");
+            const slot_file_result r = slot_file_save(ctx, *slot, filepath, model_fp, false);
+            if (!r.ok) {
+                send_slot_error(task, "slot save failed: " + r.error, ERROR_TYPE_SERVER);
+                break;
+            }
+            result.data = json{
+                { "id_slot",   id_slot },
+                { "filename",  filename },
+                { "n_saved",   r.n_tokens }, // tokens saved
+                { "n_written", r.n_bytes },  // bytes written
+                { "timings",   { { "save_ms", r.ms } } }
+            };
+        }
         queue_results.send(result);
     } break;
     case SERVER_TASK_TYPE_SLOT_RESTORE:
@@ -3148,7 +3185,7 @@ void server_context::process_single_task(server_task&& task) {
         int id_slot = task.data.at("id_slot");
         server_slot* slot = get_slot_by_id(id_slot);
         if (slot == nullptr) {
-            send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+            send_slot_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
             break;
         }
         if (!slot->available()) {
@@ -3157,24 +3194,16 @@ void server_context::process_single_task(server_task&& task) {
             queue_tasks.defer(std::move(task));
             break;
         }
-        const int64_t t_start = ggml_time_us();
 
-        std::string filename = task.data.at("filename");
-        std::string filepath = task.data.at("filepath");
-
-        slot->cache_tokens.resize(slot->n_ctx);
-        size_t token_count = 0;
-        size_t nread = llama_state_seq_load_file(ctx, filepath.c_str(), slot->id, slot->cache_tokens.data(), slot->cache_tokens.size(), &token_count);
-        if (nread == 0) {
-            slot->cache_tokens.resize(0);
-            send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
+        const std::string filename = task.data.at("filename");
+        const std::string filepath = task.data.at("filepath");
+        const slot_file_result r = slot_file_load(ctx, *slot, filepath, model_fp);
+        if (!r.ok) {
+            SLT_ERR(*slot, "restore of %s failed: %s\n", filepath.c_str(), r.error.c_str());
+            send_slot_error(task, "slot restore failed: " + r.error, ERROR_TYPE_INVALID_REQUEST);
             break;
         }
-        load_server_tokens_from_file(filepath+".tokens.json", slot->cache_tokens);
-        size_t loaded = load_checkpoints_from_file(filepath + ".checkpoints", slot->server_cached_prompt.checkpoints);
-
-        const int64_t t_end = ggml_time_us();
-        const double t_restore_ms = (t_end - t_start) / 1000.0;
+        clean_kv_cache = false; // otherwise, if no request has gone through yet, the first idle round erases it
 
         server_task_result result;
         result.id = task.id;
@@ -3182,11 +3211,9 @@ void server_context::process_single_task(server_task&& task) {
         result.data = json{
             { "id_slot",    id_slot },
             { "filename",   filename },
-            { "n_restored", token_count }, // tokens restored
-            { "n_read",     nread },       // bytes read
-            { "timings", {
-                { "restore_ms", t_restore_ms }
-            } }
+            { "n_restored", r.n_tokens }, // tokens restored
+            { "n_read",     r.n_bytes },  // bytes read
+            { "timings",    { { "restore_ms", r.ms } } }
         };
         queue_results.send(result);
     } break;
@@ -3195,7 +3222,7 @@ void server_context::process_single_task(server_task&& task) {
         int id_slot = task.data.at("id_slot");
         server_slot* slot = get_slot_by_id(id_slot);
         if (slot == nullptr) {
-            send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+            send_slot_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
             break;
         }
         if (!slot->available()) {
@@ -4261,6 +4288,9 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     }
                     apply_checkpoint(slot);
                     slot.n_prompt_tokens_cache = slot.n_past_prompt;
+                    if (slot.disk_base_pos >= 0 && slot.n_past_prompt >= slot.disk_base_pos) {
+                        slot.disk_base_pos = -1; // the prompt read restarts already past the common prefix
+                    }
                     slot.n_prompt_tokens_processed = 0;
                 }
 
@@ -4381,7 +4411,10 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     }
 
                     int p0 = system_tokens.size() + slot.cache_tokens.pos_next();
-                    common_batch_add(batch, cur_tok, p0, { slot.id }, slot.need_embd());
+                    // Logits only where needed: with MTP the engine already keeps the hidden states
+                    // of all tokens (n_outputs_embd); marking every prompt token computed the head over the whole batch
+                    // (512 x 248k: 1.3 TFLOP and 1.47 GB of buffer per batch)
+                    common_batch_add(batch, cur_tok, p0, { slot.id }, slot.embedding);
 
                     slot.cache_tokens.push_back(cur_tok);
 
@@ -4394,6 +4427,9 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     if (params_base.do_checkpoint && slot.n_prompt_tokens - slot.n_past_prompt == params_base.ctx_checkpoints_tolerance) {
                         slot.do_checkpoint = true;
                         break;
+                    }
+                    if (slot.n_past_prompt == slot.disk_base_pos) {
+                        break; // end of the common prefix: after this batch the state goes to disk as the base
                     }
 
                 }
@@ -5017,6 +5053,12 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             if (!is_active_slot || slot.i_batch < (int)i || slot.i_batch >= (int)(i + n_tokens)) {
                 // save checkpoint during prompt processing
                 if (slot.command == SLOT_COMMAND_LOAD_PROMPT) {
+                    // the batch that ends on the common prefix has been fully decoded (KV up to there)
+                    if (slot.disk_base_pos > 0 && slot.n_past_prompt == slot.disk_base_pos &&
+                        llama_kv_cache_seq_pos_max(ctx, slot.id) + 1 == slot.disk_base_pos) {
+                        disk_cache->save_base(*this, slot);
+                        create_checkpoint(slot);
+                    }
                     if (slot.do_checkpoint) {
                         create_checkpoint(slot, true);
                     } else {

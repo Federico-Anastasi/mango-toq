@@ -521,6 +521,7 @@ struct llama_hadamard_transform {
     int64_t perm_hd  = 1;                 // GDN v-grouped reshape (head dim)
     int64_t perm_nk  = 1;                 // GDN v-grouped reshape (n groups)
     int64_t perm_rep = 1;                 // GDN v-grouped reshape (repeat count)
+    int64_t chunk_rows = 0;               // TRL: rows per slice, each with its own row of `signs` [ne0, slices]; 0 = one
 };
 
 struct llama_model {
@@ -536,6 +537,9 @@ struct llama_model {
     // Prism ternary Hadamard rotations, keyed by GGUF weight name (empty for other models)
     std::unordered_map<std::string, llama_hadamard_transform> hadamard_map;
     const llama_hadamard_transform * hadamard_rotation(const struct ggml_tensor * t) const;
+    // TRL: low-rank correction of the distillation inside the model (tensors <weight>.lora_a/b), by name
+    // of the weight: a [K, r], b [r, N]; the product becomes W x + b (a x), scale 1 (llm_add_lora)
+    std::unordered_map<std::string, std::pair<struct ggml_tensor *, struct ggml_tensor *>> trl_lora;
 
     struct ggml_tensor * tok_embd;
     struct ggml_tensor * type_embd;
@@ -618,6 +622,8 @@ struct llama_model {
     std::vector<rpc_device> rpc_servers;
     std::vector<int32_t> devices;
     std::vector<int32_t> default_layer_device;
+    // context that uses prefill on the main GPU (it swaps the pointers of the model's tensors): only one
+    mutable const void * prefill_main_owner = nullptr;
     std::vector<float>   aux_buffer;
 
     // gguf metadata

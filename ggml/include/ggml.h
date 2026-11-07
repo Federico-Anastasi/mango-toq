@@ -463,6 +463,10 @@ extern "C" {
         GGML_TYPE_Q1_0_G128_R8 = 159, // 8-row repacked Q1_0_G128 (Bonsai), vec_dot_type = Q8_K128
         GGML_TYPE_PQ2_0_R8   = 160, // 8-row repacked PQ2_0 (Prism ternary)
         GGML_TYPE_PTQ1_0_R8  = 161, // 8-row repacked PTQ1_0 (Prism ternary, base-3)
+        GGML_TYPE_TRL2_G     = 162, // trellis, 2 bit, gaussian codebook, bands of 64 rows (ggml-trl.h)
+        GGML_TYPE_TRL3_G     = 163, // 3 bit, gaussian
+        GGML_TYPE_TRL2_M     = 164, // 2 bit, computed codebook mul1
+        GGML_TYPE_TRL3_M     = 165, // 3 bit, mul1
 
         GGML_TYPE_Q4_0_R8    = 202,
         GGML_TYPE_Q5_0_R4    = 206,
@@ -2689,6 +2693,19 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             struct ggml_tensor  * saved_steps);
+
+    // ggml_delta_net with the recurrent states kept in a pool of slots and updated in place (one decode step of
+    // several sequences): pool {S_v*S_v*H_v, n_slots}, ids I32 {n_seqs}. The result holds only the output.
+    // CUDA only.
+    GGML_API struct ggml_tensor * ggml_delta_net_slots(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * pool,
+            struct ggml_tensor  * ids);
 
     GGML_API struct ggml_tensor * ggml_indexer_topk(
             struct ggml_context * ctx,

@@ -1088,6 +1088,26 @@ extern "C" {
                           size_t   n_token_capacity,
                           size_t * n_token_count_out);
 
+    // Like the two above, plus the XXH64 hash (seed 0) of the tokens and of the state bytes written
+    // or read: whoever keeps the file compares it on restore to recognize a corrupted file.
+    // hash_out can be NULL.
+    LLAMA_API size_t llama_state_seq_save_file_hashed(
+            struct llama_context * ctx,
+                      const char * filepath,
+                    llama_seq_id   seq_id,
+               const llama_token * tokens,
+                          size_t   n_token_count,
+                        uint64_t * hash_out);
+
+    LLAMA_API size_t llama_state_seq_load_file_hashed(
+            struct llama_context * ctx,
+                      const char * filepath,
+                    llama_seq_id   dest_seq_id,
+                     llama_token * tokens_out,
+                          size_t   n_token_capacity,
+                          size_t * n_token_count_out,
+                        uint64_t * hash_out);
+
     //
     // Decoding
     //

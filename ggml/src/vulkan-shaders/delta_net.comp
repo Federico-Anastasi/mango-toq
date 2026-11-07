@@ -1,0 +1,93 @@
+#version 450
+
+// GGML_OP_DELTA_NET (ggml_delta_net in ggml.c), like iqk_fused_delta_net_impl on the CPU: q and k arrive already
+// normalized, state [row v, column k] in state[row + col*S], decay exp(min(g, 50)), state clamped to +-1e6.
+// One group = one head of a sequence; one thread = one row of the state, kept in registers.
+// Output: [S, H, n_tokens, n_seqs] then the final state; saved_steps (optional) receives the state after every token
+// except the last.
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(constant_id = 0) const uint S = 128;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer Q {float data_q[];};
+layout (binding = 1) readonly buffer K {float data_k[];};
+layout (binding = 2) readonly buffer V {float data_v[];};
+layout (binding = 3) readonly buffer G {float data_g[];};
+layout (binding = 4) readonly buffer B {float data_beta[];};
+layout (binding = 5) readonly buffer SI {float data_s[];};
+layout (binding = 6) writeonly buffer SV {float data_saved[];};
+layout (binding = 7) writeonly buffer D {float data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint n_tokens;
+    uint n_heads;       // H_v
+    uint gqa;           // H_v / H_k
+    uint repeat_type;
+    uint v_nb1, v_nb2, v_nb3;       // strides in float
+    uint g_nb0, g_nb2, g_nb3;
+    uint b_nb1, b_nb2, b_nb3;
+    uint q_off, k_off, v_off, g_off, b_off, s_off, sv_off, d_off;   // misalignment of the bindings, in float
+    uint has_saved;
+    uint n_seqs;
+} p;
+
+shared float sh_q[S];
+shared float sh_k[S];
+
+void main() {
+    const uint row = gl_LocalInvocationID.x;
+    const uint head = gl_WorkGroupID.x;
+    const uint seq = gl_WorkGroupID.y;
+    const uint H_k = p.n_heads / p.gqa;
+    const uint head_kq = p.repeat_type == 0 ? head / p.gqa : head % H_k;
+
+    const uint qk_base = seq * (S * p.n_tokens * H_k) + head_kq * (S * p.n_tokens);
+    const uint state_head = seq * (S * S * p.n_heads) + head * (S * S);
+    const uint state_step = S * S * p.n_heads * p.n_seqs;
+    const uint out_size = S * p.n_heads * p.n_tokens * p.n_seqs;
+    const float scale = inversesqrt(float(S));
+
+    float s[S];
+    [[unroll]] for (uint col = 0; col < S; ++col) {
+        s[col] = data_s[p.s_off + state_head + row + col * S];
+    }
+
+    for (uint t = 0; t < p.n_tokens; ++t) {
+        barrier();
+        sh_q[row] = data_q[p.q_off + qk_base + t * S + row];
+        sh_k[row] = data_k[p.k_off + qk_base + t * S + row];
+        barrier();
+
+        const float g_val    = data_g[p.g_off + t * p.g_nb0 + head * p.g_nb2 + seq * p.g_nb3];
+        const float beta_raw = data_beta[p.b_off + t * p.b_nb1 + head * p.b_nb2 + seq * p.b_nb3];
+        const float beta_val = 1.0 / (1.0 + exp(-beta_raw));
+        const float decay    = exp(min(g_val, 50.0));
+
+        float kq = 0.0, v_prime = 0.0, out_val = 0.0;
+        [[unroll]] for (uint col = 0; col < S; ++col) {
+            kq      += sh_k[col] * sh_q[col];
+            v_prime += s[col] * sh_k[col];
+            out_val += s[col] * sh_q[col];
+        }
+        const float v_t = data_v[p.v_off + seq * p.v_nb3 + head * p.v_nb2 + t * p.v_nb1 + row];
+        const float v_new = v_t * beta_val - v_prime * beta_val * decay;
+        data_d[p.d_off + seq * (S * p.n_heads * p.n_tokens) + t * (S * p.n_heads) + head * S + row] =
+            out_val * decay * scale + v_new * kq * scale;
+
+        [[unroll]] for (uint col = 0; col < S; ++col) {
+            s[col] = clamp(decay * s[col] + v_new * sh_k[col], -1e6, 1e6);
+        }
+        if (p.has_saved != 0 && t + 1 < p.n_tokens) {
+            [[unroll]] for (uint col = 0; col < S; ++col) {
+                data_saved[p.sv_off + state_head + t * state_step + row + col * S] = s[col];
+            }
+        }
+    }
+
+    [[unroll]] for (uint col = 0; col < S; ++col) {
+        data_d[p.d_off + out_size + state_head + row + col * S] = s[col];
+    }
+}

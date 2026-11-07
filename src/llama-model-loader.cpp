@@ -1791,3 +1791,131 @@ void llm_load_hadamard(llama_model_loader & ml, llama_model & model) {
     LLAMA_LOG_INFO("%s: PrismML Hadamard enabled: %zu rotated weights, %u sign widths, %zu inverse rows, block %u\n",
             __func__, weight_names.size(), (uint32_t) signs_by_width.size(), inverse_names.size(), block_size);
 }
+
+
+// TRL (ggml/src/ggml-trl.h): every TRL linear wants x~ = Hblk(d . x). The GGUF carries
+//   trl.rot.names (strings), trl.rot.block, trl.rot.chunk_rows (uint32) and, for the i-th tensor,
+//   the float array trl.rot.d.<i> = d [ne0 * slices] (slices = ne1 / chunk_rows, the head in slices).
+// The vectors are created here, on the buffer (GPU) of the weight, like the Prism signs above.
+void llm_load_trl(llama_model_loader & ml, llama_model & model) {
+    const int kn = gguf_find_key(ml.meta, "trl.rot.names");
+    if (kn < 0) {
+        return;
+    }
+    std::string codebook;
+    ml.get_key("trl.codebook", codebook, false);
+    uint32_t L = 0;
+    ml.get_key("trl.L", L, false);
+    if (L != 14) {
+        throw std::runtime_error(format("TRL: trl.L = %u, the engine only reads L = 14", L));
+    }
+    std::vector<uint32_t> blocks, chunk_rows, gdn;
+    ml.get_arr("trl.rot.block", blocks, true);
+    ml.get_arr("trl.rot.chunk_rows", chunk_rows, true);
+    ml.get_arr("trl.rot.gdn_v_grouped", gdn, true);
+    const int n = gguf_get_arr_n(ml.meta, kn);
+    if ((int) blocks.size() != n || (int) chunk_rows.size() != n || (int) gdn.size() != n) {
+        throw std::runtime_error("TRL: trl.rot.* have different lengths");
+    }
+    std::unordered_map<std::string, ggml_tensor *> by_name;
+    for (const auto & kv : model.tensors_by_name) {
+        by_name[kv.first] = kv.second;
+    }
+    struct trl_rot { std::string name; int64_t K, nch; int kd; };
+    std::map<ggml_backend_buffer_type_t, std::vector<trl_rot>> per_buft;
+    for (int i = 0; i < n; ++i) {
+        const std::string name = gguf_get_arr_str(ml.meta, kn, i);
+        const auto it = by_name.find(name);
+        ggml_tensor * w = it != by_name.end() ? it->second : nullptr;
+        if (w == nullptr || w->buffer == nullptr) {
+            // without MTP active the weights of the MTP layer (blk.<n_layer - nextn>.*) are skipped at load:
+            // their rotation is not needed. Any other missing weight is still an error.
+            const int nextn = (int) model.hparams.nextn_predict_layers;
+            const std::string mtp_prefix = "blk." + std::to_string((int) model.hparams.n_layer - nextn) + ".";
+            if (!model.mtp && nextn > 0 && name.rfind(mtp_prefix, 0) == 0) {
+                continue;
+            }
+            throw std::runtime_error(format("TRL: weight %s not loaded", name.c_str()));
+        }
+        if (w->type != GGML_TYPE_TRL2_G && w->type != GGML_TYPE_TRL3_G &&
+            w->type != GGML_TYPE_TRL2_M && w->type != GGML_TYPE_TRL3_M) {
+            throw std::runtime_error(format("TRL: %s has type %s, not TRL", name.c_str(), ggml_type_name(w->type)));
+        }
+        const bool is_m = w->type == GGML_TYPE_TRL2_M || w->type == GGML_TYPE_TRL3_M;
+        if ((codebook == "mul1") != is_m) {
+            throw std::runtime_error(format("TRL: %s of type %s but trl.codebook = %s", name.c_str(),
+                                            ggml_type_name(w->type), codebook.c_str()));
+        }
+        const int64_t K = w->ne[0], N = w->ne[1];
+        const int64_t blk = blocks[i], rows = chunk_rows[i];
+        if (blk <= 0 || (blk & (blk - 1)) != 0 || K % blk != 0 || rows <= 0 || rows % 64 != 0 || N % 64 != 0) {
+            throw std::runtime_error(format("TRL: %s block %lld / slice %lld not valid for [%lld, %lld]",
+                                            name.c_str(), (long long) blk, (long long) rows, (long long) K, (long long) N));
+        }
+        const int64_t nch = (N + rows - 1) / rows;          // the last slice may be shorter (head: 248320 rows)
+        const std::string dk = "trl.rot.d." + std::to_string(i);
+        const int kd = gguf_find_key(ml.meta, dk.c_str());
+        if (kd < 0 || gguf_get_arr_type(ml.meta, kd) != GGUF_TYPE_FLOAT32 || gguf_get_arr_n(ml.meta, kd) != K * nch) {
+            throw std::runtime_error(format("TRL: %s missing or of the wrong length", dk.c_str()));
+        }
+        ggml_backend_buffer_type_t wb = ggml_backend_buffer_get_type(w->buffer);
+        ggml_backend_buffer_type_t buft = ggml_backend_buft_is_host(wb) ? llama_default_buffer_type_cpu(true) : wb;
+        llama_hadamard_transform & t = model.hadamard_map[name];
+        t.signs = nullptr;
+        t.block_size = blk;
+        t.chunk_rows = nch > 1 ? rows : 0;
+        if (gdn[i]) {
+            // ssm_out quantized with the columns in HF order (V heads grouped by K head): the engine's
+            // input arrives in tiles and is reordered before the rotation, as Prism does.
+            const int64_t n_v = (int64_t) model.hparams.ssm_dt_rank;
+            const int64_t n_k = (int64_t) model.hparams.ssm_n_group;
+            if (n_v <= 0 || n_k <= 0 || K % n_v != 0 || n_v % n_k != 0) {
+                throw std::runtime_error(format("TRL: %s GDN reordering impossible (n_v %lld, n_k %lld)",
+                                                name.c_str(), (long long) n_v, (long long) n_k));
+            }
+            t.perm_hd  = K / n_v;
+            t.perm_nk  = n_k;
+            t.perm_rep = n_v / n_k;
+        }
+        per_buft[buft].push_back({name, K, nch, kd});
+    }
+    // One context and one buffer per GPU: ggml has at most GGML_MAX_CONTEXTS (64) live contexts, and one
+    // context per vector exhausted them at the sixty-fifth (ggml_init -> NULL, crash at load).
+    for (auto & [buft, list] : per_buft) {
+        ggml_init_params params = { list.size() * ggml_tensor_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(params);
+        if (ctx == nullptr) {
+            throw std::runtime_error("TRL: ggml_init failed for the rotation vectors");
+        }
+        std::vector<ggml_tensor *> ts;
+        for (const auto & r : list) {
+            ggml_tensor * d = r.nch > 1 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, r.K, r.nch)
+                                        : ggml_new_tensor_1d(ctx, GGML_TYPE_F32, r.K);
+            ggml_set_name(d, (r.name + ".trl_rot").c_str());
+            ts.push_back(d);
+        }
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        if (buf == nullptr) {
+            ggml_free(ctx);
+            throw std::runtime_error("TRL: allocation of the rotation vectors failed");
+        }
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        for (size_t j = 0; j < list.size(); ++j) {
+            ggml_backend_tensor_set(ts[j], gguf_get_arr_data(ml.meta, list[j].kd), 0, list[j].K * list[j].nch * sizeof(float));
+            model.hadamard_map[list[j].name].signs = ts[j];
+        }
+        model.ctxs.push_back(ctx);
+        model.bufs.push_back(buf);
+    }
+    // low-rank correction inside the model: tensors <weight>.lora_a / .lora_b, created together with their weight
+    // (create_trl_lora in llama-load-tensors.cpp) and loaded with the other tensors
+    if (!model.trl_lora.empty()) {
+        size_t tot = 0;
+        for (const auto & [name, ab] : model.trl_lora) {
+            tot += ggml_nbytes(ab.first) + ggml_nbytes(ab.second);
+        }
+        LLAMA_LOG_INFO("%s: TRL LoRA inside the model: %zu weights, rank %lld, %.1f MiB\n", __func__, model.trl_lora.size(),
+                       (long long) model.trl_lora.begin()->second.first->ne[1], tot / 1048576.0);
+    }
+    LLAMA_LOG_INFO("%s: TRL %s: %d trellis weights with input rotation\n", __func__, codebook.c_str(), n);
+}

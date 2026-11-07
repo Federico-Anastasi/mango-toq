@@ -76,6 +76,19 @@ void quantize_row_iq1_m  (const float * GGML_RESTRICT x, void * GGML_RESTRICT y,
 // Dequantization
 void dequantize_row_q2_0(const block_q2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+// TRL (ggml-trl.h): k = 64 rows x K columns of ONE band (or several whole bands)
+void dequantize_row_trl2_g(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void dequantize_row_trl3_g(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void dequantize_row_trl2_m(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void dequantize_row_trl3_m(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+// TRL on the CPU. ggml_trl_rotate: one Hadamard block [k0, k0 + blk) of x~ = Hblk(d . reorder(x)) into y.
+// ggml_trl_mul_mat_bands: y[c*ldy + r] = sum_k W[r, k] x[c*ldx + k] for nbands whole bands of W (K columns); work
+// (64*K floats) is needed only if ggml_trl_needs_work(ncols).
+#define GGML_TRL_GEMV_MAX_COLS 4
+void ggml_trl_rotate(const float * x, const float * d, int blk, int hd, int nk, int rep, int64_t k0, float * y);
+int  ggml_trl_needs_work(int64_t ncols);
+void ggml_trl_mul_mat_bands(enum ggml_type type, const void * w, int64_t K, int64_t nbands, const float * x,
+                            int64_t ldx, int64_t ncols, float * y, int64_t ldy, float * work);
 void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 void dequantize_row_q5_0(const block_q5_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 void dequantize_row_q5_1(const block_q5_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);

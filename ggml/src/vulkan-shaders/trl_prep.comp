@@ -1,0 +1,71 @@
+#version 450
+
+// Input of the TRL products (ggml-trl.h): x~ = Hblk(d . perm(x)) / sqrt(blk), one column at a time.
+// One group = one Hadamard block of a column. Without d (has_d = 0) the input arrives already rotated
+// by the graph: it is copied into a contiguous buffer.
+// perm (rep > 1): V heads from the tiled order [hd, nk, rep] to the HF one [hd, rep, nk], like trl_prep in CUDA.
+
+#extension GL_EXT_control_flow_attributes : enable
+
+#define BLOCK_SIZE 256
+#define MAX_BLK 4096
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer X {float data_x[];};
+layout (binding = 1) readonly buffer DV {float data_dv[];};
+layout (binding = 2) writeonly buffer Y {float data_y[];};
+
+layout (push_constant) uniform parameter {
+    uint K;
+    uint x_stride;   // floats between two columns of x
+    uint x_offset;   // floats, binding misalignment
+    uint d_offset;
+    uint blk;
+    uint hd;
+    uint nk;
+    uint rep;
+    uint has_d;
+} p;
+
+shared float sm[MAX_BLK];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint col = gl_WorkGroupID.y;
+    const uint k0 = gl_WorkGroupID.x * p.blk;
+    const uint xb = p.x_offset + col * p.x_stride;
+
+    for (uint o = tid; o < p.blk; o += BLOCK_SIZE) {
+        const uint gi = k0 + o;
+        if (p.has_d == 0) {
+            sm[o] = data_x[xb + gi];
+            continue;
+        }
+        uint src = gi;
+        if (p.rep > 1) {
+            const uint hdi = gi % p.hd, t = gi / p.hd, repi = t % p.rep, nki = t / p.rep;
+            src = hdi + p.hd * (nki + p.nk * repi);
+        }
+        sm[o] = data_x[xb + src] * data_dv[p.d_offset + gi];
+    }
+    barrier();
+
+    float scale = 1.0;
+    if (p.has_d != 0) {
+        for (uint h = 1; h < p.blk; h <<= 1) {
+            for (uint q = tid; q < p.blk / 2; q += BLOCK_SIZE) {
+                const uint i = (q / h) * 2 * h + (q % h), j = i + h;
+                const float a = sm[i], b = sm[j];
+                sm[i] = a + b;
+                sm[j] = a - b;
+            }
+            barrier();
+        }
+        scale = inversesqrt(float(p.blk));
+    }
+
+    for (uint o = tid; o < p.blk; o += BLOCK_SIZE) {
+        data_y[col * p.K + k0 + o] = sm[o] * scale;
+    }
+}

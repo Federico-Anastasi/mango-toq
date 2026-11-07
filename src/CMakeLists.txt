@@ -145,6 +145,8 @@ add_library(llama
 
 target_include_directories(llama PUBLIC . ../include)
 target_include_directories(llama PRIVATE ../ggml/src)
+# xxhash (header only) for the hash of the state files
+target_include_directories(llama PRIVATE ../examples/gguf-hash/deps)
 target_compile_features   (llama PUBLIC cxx_std_17)
 
 target_link_libraries(llama PUBLIC ggml)

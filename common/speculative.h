@@ -235,6 +235,11 @@ bool common_speculative_has_sequence_hidden(const common_speculative * spec, lla
 
 void common_speculative_clear_sequence_hidden(common_speculative * spec, llama_seq_id seq_id);
 
+// Hidden state of the sequence's last position (MTP): it conditions the first row of the next
+// batch. It is saved and restored with the slot state (server-slot-file.cpp). Empty if missing.
+std::vector<float> common_speculative_get_sequence_hidden(const common_speculative * spec, llama_seq_id seq_id);
+bool common_speculative_set_sequence_hidden(common_speculative * spec, llama_seq_id seq_id, const std::vector<float> & hidden);
+
 void common_speculative_clear_sequence(
     common_speculative * spec,
     llama_seq_id seq_id,

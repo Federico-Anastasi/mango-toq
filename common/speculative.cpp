@@ -2197,6 +2197,13 @@ bool common_speculative_prepare_mtp_runtime(
     params.cparams_dft.mtp         = true;
     params.cparams_dft.mtp_op_type = MTP_OP_WARMUP;
     params.cparams_dft.embeddings  = true;
+    // Small batches for the MTP context: it only needs them to warm up on the prompt (the MTP layer is
+    // light) and at long context its compute buffer for 512 tokens costs ~200 MB on the main GPU
+    {
+        const char * env = getenv("LLAMA_MTP_UBATCH");
+        const uint32_t ub = env ? (uint32_t) atoi(env) : 128u;
+        if (ub > 0 && params.cparams_dft.n_ubatch > ub) params.cparams_dft.n_ubatch = ub;
+    }
 
     return true;
 }
@@ -3039,6 +3046,25 @@ bool common_speculative_has_sequence_hidden(const common_speculative * spec, lla
 
     auto it = mtp_state->target_hidden_by_seq.find(seq_id);
     return it != mtp_state->target_hidden_by_seq.end() && !it->second.empty();
+}
+
+std::vector<float> common_speculative_get_sequence_hidden(const common_speculative * spec, llama_seq_id seq_id) {
+    const auto * mtp_state = common_speculative_get_mtp_state(spec);
+    if (mtp_state == nullptr) {
+        return {};
+    }
+    auto it = mtp_state->target_hidden_by_seq.find(seq_id);
+    return it == mtp_state->target_hidden_by_seq.end() ? std::vector<float>() : it->second;
+}
+
+bool common_speculative_set_sequence_hidden(common_speculative * spec, llama_seq_id seq_id, const std::vector<float> & hidden) {
+    auto * mtp_state = common_speculative_get_mtp_state(spec);
+    if (mtp_state == nullptr || (int) hidden.size() != mtp_state->n_embd) {
+        return false;
+    }
+    mtp_store_target_hidden(*mtp_state, seq_id, hidden.data(), (int32_t) hidden.size());
+    mtp_invalidate_cached_draft(*mtp_state, seq_id);
+    return true;
 }
 
 void common_speculative_clear_sequence_hidden(common_speculative * spec, llama_seq_id seq_id) {

@@ -32,6 +32,10 @@ struct server_queue {
     std::function<void(server_task_multi &)> callback_finish_multitask;
     std::function<void(void)>                callback_update_slots;
 
+    // called every idle_ms while the queue is empty (idle save of the disk cache)
+    std::function<void(void)> callback_idle;
+    int idle_ms = 0;
+
 
     // Add a new task to the end of the queue
     int post(server_task task);
@@ -57,6 +61,11 @@ struct server_queue {
     // Register the function to be called when all slots data is ready to be processed
     void on_update_slots(std::function<void(void)> callback) {
         callback_update_slots = std::move(callback);
+    }
+
+    void on_idle(std::function<void(void)> callback, int period_ms) {
+        callback_idle = std::move(callback);
+        idle_ms = period_ms;
     }
 
     // Call when the state of one slot is changed

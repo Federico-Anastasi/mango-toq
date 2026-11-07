@@ -1,0 +1,60 @@
+#version 450
+
+// GGML_OP_SSM_CONV (ggml_ssm_conv in ggml.c) with a single sequence (n_kv = 1), like on the CPU:
+// output [d_inner, n_tokens], then the state {d_conv, d_inner}: the window of the last d_conv inputs.
+// saved_steps (optional) receives, after every token, the last d_conv - 1 inputs.
+// One thread = one channel.
+
+#extension GL_EXT_control_flow_attributes : enable
+
+#define MAX_CONV 8
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer S0 {float data_s0[];};
+layout (binding = 1) readonly buffer X {float data_x[];};
+layout (binding = 2) readonly buffer C {float data_c[];};
+layout (binding = 3) writeonly buffer SV {float data_saved[];};
+layout (binding = 4) writeonly buffer D {float data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint nc, nr, n_t;
+    uint s0_nb1, x_nb1, c_nb1;                  // float
+    uint s0_off, x_off, c_off, sv_off, d_off;   // float
+    uint has_saved;
+} p;
+
+void main() {
+    const uint i1 = gl_GlobalInvocationID.x;
+    if (i1 >= p.nr) {
+        return;
+    }
+
+    float w[MAX_CONV];
+    for (uint i0 = 0; i0 + 1 < p.nc; ++i0) {
+        w[i0 + 1] = data_s0[p.s0_off + i1 * p.s0_nb1 + i0];
+    }
+
+    for (uint t = 0; t < p.n_t; ++t) {
+        for (uint i0 = 0; i0 + 1 < p.nc; ++i0) {
+            w[i0] = w[i0 + 1];
+        }
+        w[p.nc - 1] = data_x[p.x_off + t * p.x_nb1 + i1];
+
+        float sum = 0.0;
+        for (uint i0 = 0; i0 < p.nc; ++i0) {
+            sum += w[i0] * data_c[p.c_off + i1 * p.c_nb1 + i0];
+        }
+        data_d[p.d_off + t * p.nr + i1] = sum;
+
+        if (p.has_saved != 0) {
+            for (uint i0 = 0; i0 + 1 < p.nc; ++i0) {
+                data_saved[p.sv_off + t * p.nr * (p.nc - 1) + i1 * (p.nc - 1) + i0] = w[i0 + 1];
+            }
+        }
+    }
+
+    for (uint i0 = 0; i0 < p.nc; ++i0) {
+        data_d[p.d_off + p.nr * p.n_t + i1 * p.nc + i0] = w[i0];
+    }
+}

@@ -14,6 +14,7 @@
 #include "fattn-new-mma.cuh"
 #include "fattn.cuh"
 #include "dsa_attn.cuh"
+#include "fattn-q8-gqa.cuh"
 
 #include <cstdint>
 
@@ -36,7 +37,7 @@ static inline bool is_pascal_hs512(const int cc, const ggml_tensor * K, const gg
     return cc >= CC_PASCAL && cc < CC_VOLTA && K->ne[0] == 512 && V->ne[0] == 512;
 }
 
-void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static void ggml_cuda_flash_attn_ext_orig(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV  = dst;
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
@@ -264,4 +265,75 @@ bool ggml_cuda_fattn_is_supported(ggml_backend_cuda_context & ctx, const ggml_te
     }
 
     return ggml_cuda_fattn_mma_f16_is_supported(ctx, dst);
+}
+
+// Decode with q8_0 cache and GQA: kernel that reads the cache once for all the heads of the group, without
+// converting it to f16 (fattn-q8-gqa.cu). FA_Q8_GQA=0 turns it off; FA_Q8_CHECK=1 also computes the usual path
+// and prints the relative difference (sentinel; turn off CUDA graphs, GGML_CUDA_DISABLE_GRAPHS=1).
+#include "fattn-q8-prefill.cuh"
+
+void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // Prompt reading with q8_0 cache without converting it to f16 (FA_Q8_PREFILL=1): ~38 MB temporary instead of ~480 at
+    // 120k (needed for the 3060's memory with MTP at long context), 25 times smaller error, but 0.7x the speed.
+    static const bool q8_prefill = getenv("FA_Q8_PREFILL") != nullptr && atoi(getenv("FA_Q8_PREFILL")) != 0;
+    if (q8_prefill && dst->src[0]->ne[1] > 4 && ggml_cuda_fattn_q8_prefill_supported(dst)) {
+        ggml_cuda_fattn_q8_prefill(ctx, dst);
+        return;
+    }
+    static const bool on    = getenv("FA_Q8_GQA") == nullptr || atoi(getenv("FA_Q8_GQA")) != 0;
+    static const bool check = getenv("FA_Q8_CHECK") != nullptr;
+    if (!on || !ggml_cuda_fattn_q8_gqa_supported(dst)) {
+        ggml_cuda_flash_attn_ext_orig(ctx, dst);
+        return;
+    }
+    // Diagnostics (FA_Q8_DUMP=<file>): saves Q, K, V, mask and parameters of the real calls (the first FA_Q8_DUMP_N
+    // with at least FA_Q8_DUMP_FROM positions), to reproduce the kernel outside the engine on the model's data.
+    static const char * dump = getenv("FA_Q8_DUMP");
+    if (dump) {
+        static int left = getenv("FA_Q8_DUMP_N") ? atoi(getenv("FA_Q8_DUMP_N")) : 32;
+        static const int64_t from = getenv("FA_Q8_DUMP_FROM") ? atoll(getenv("FA_Q8_DUMP_FROM")) : 0;
+        const ggml_tensor * Q = dst->src[0], * K = dst->src[1], * V = dst->src[2], * M = dst->src[3];
+        if (left > 0 && K->ne[1] >= from) {
+            --left;
+            FILE * f = fopen(dump, "ab");
+            if (f) {
+                float scale; memcpy(&scale, (const float *) dst->op_params, sizeof(float));
+                const int64_t h[16] = { 0x46415138, K->ne[0], Q->ne[1], Q->ne[2], K->ne[2], K->ne[1],
+                                        (int64_t) Q->nb[1], (int64_t) Q->nb[2], (int64_t) K->nb[1], (int64_t) K->nb[2],
+                                        (int64_t) V->nb[1], (int64_t) V->nb[2], M ? (int64_t) M->nb[1] : 0,
+                                        (int64_t) ggml_nbytes(Q), (int64_t) ggml_nbytes(K), M ? (int64_t) ggml_nbytes(M) : 0 };
+                fwrite(h, sizeof(h), 1, f);
+                fwrite(&scale, sizeof(float), 1, f);
+                const ggml_tensor * ts[4] = { Q, K, V, M };
+                const size_t ns[4] = { ggml_nbytes(Q), ggml_nbytes(K), ggml_nbytes(V), M ? ggml_nbytes(M) : 0 };
+                std::vector<char> buf;
+                for (int i = 0; i < 4; ++i) {
+                    if (!ts[i]) continue;
+                    buf.resize(ns[i]);
+                    CUDA_CHECK(cudaMemcpyAsync(buf.data(), ts[i]->data, ns[i], cudaMemcpyDeviceToHost, ctx.stream()));
+                    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+                    fwrite(buf.data(), 1, ns[i], f);
+                }
+                fclose(f);
+            }
+        }
+    }
+    if (!check) {
+        ggml_cuda_fattn_q8_gqa(ctx, dst);
+        return;
+    }
+    const int64_t n = ggml_nelements(dst);
+    ggml_cuda_pool_alloc<float> mine(ctx.pool(), n);
+    ggml_tensor tmp = *dst;
+    tmp.data = mine.get();
+    ggml_cuda_fattn_q8_gqa(ctx, &tmp);
+    ggml_cuda_flash_attn_ext_orig(ctx, dst);
+    std::vector<float> a(n), b(n);
+    CUDA_CHECK(cudaMemcpyAsync(a.data(), mine.get(), n * sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaMemcpyAsync(b.data(), dst->data, n * sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    double num = 0, den = 0;
+    for (int64_t i = 0; i < n; ++i) { num += (a[i] - b[i]) * (a[i] - b[i]); den += (double) b[i] * b[i]; }
+    fprintf(stderr, "FA_Q8_CHECK n_kv %6lld heads %lld/%lld diff %.2e\n", (long long) dst->src[1]->ne[1],
+            (long long) dst->src[0]->ne[2], (long long) dst->src[1]->ne[2], sqrt(num / (den + 1e-30)));
 }

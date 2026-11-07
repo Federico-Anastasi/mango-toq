@@ -122,6 +122,8 @@ void llm_build_context::init() {
         lctx.inp_s_mask      = nullptr;
         lctx.inp_s_seq       = nullptr;
         lctx.inp_s_seq_qnext = nullptr;
+        lctx.inp_s_slots     = nullptr;
+        lctx.inp_s_seq_multi = nullptr;
         lctx.inp_pos_bucket    = nullptr;
         lctx.inp_embd_enc      = nullptr;
         lctx.inp_KQ_mask_cross = nullptr;
@@ -1059,12 +1061,82 @@ void llm_build_context::llm_build_kv_store(
     }
 }
 
+static inline bool llm_is_trl(ggml_type t) {
+    return t == GGML_TYPE_TRL2_G || t == GGML_TYPE_TRL3_G || t == GGML_TYPE_TRL2_M || t == GGML_TYPE_TRL3_M;
+}
+
+// res += scale * B (A cur) for each adapter that corrects `w` (cur in the model's base, not rotated)
+static ggml_tensor * llm_add_lora(llama_context & lctx, ggml_context * ctx0, ggml_tensor * w, ggml_tensor * cur,
+                                  ggml_tensor * res) {
+    if (!lctx.model.trl_lora.empty()) {           // distillation correction, inside the model (scale 1)
+        if (auto it = lctx.model.trl_lora.find(w->name); it != lctx.model.trl_lora.end()) {
+            res = ggml_add(ctx0, res, ggml_mul_mat(ctx0, it->second.second, ggml_mul_mat(ctx0, it->second.first, cur)));
+        }
+    }
+    for (auto & it : lctx.lora_adapters) {
+        struct llama_lora_weight * lora = it.first->get_weight(w);
+        if (lora == nullptr) {
+            continue;
+        }
+        const float alpha = it.first->alpha;
+        const float rank  = (float) lora->b->ne[0];
+        const float scale = alpha ? it.second * alpha / rank : it.second;
+        struct ggml_tensor * ab_cur = ggml_mul_mat(ctx0, lora->b, ggml_mul_mat(ctx0, lora->a, cur));
+        ab_cur = ggml_scale(ctx0, ab_cur, scale);
+        res = ggml_add(ctx0, res, ab_cur);
+    }
+    return res;
+}
+
 ggml_tensor * llm_build_context::llm_build_lora_mm(
         struct llama_context & lctx,
          struct ggml_context * ctx0,
           struct ggml_tensor * w,
           struct ggml_tensor * cur) {
     struct ggml_tensor * cur_mm = cur;
+    if (auto rot = lctx.model.hadamard_rotation(w); rot != nullptr && llm_is_trl(w->type)) {
+        // TRL: the input rotation (d, block, GDN reordering) travels with the product (src[2] + op_params) and the
+        // kernel does it together with the quantization of the activation: no separate MUL and HADAMARD for each weight.
+        // A low-rank correction (adapter) is added in the model's base: B (A x), x not rotated.
+        struct ggml_tensor * x = cur->type == GGML_TYPE_F32 ? cur : ggml_cast(ctx0, cur, GGML_TYPE_F32);
+        if (!ggml_is_contiguous(x)) {
+            x = ggml_cont(ctx0, x);
+        }
+        const int64_t R = rot->chunk_rows > 0 ? rot->chunk_rows : w->ne[1];
+        const int64_t nch = (w->ne[1] + R - 1) / R;            // head in slices: the last one may be shorter
+        struct ggml_tensor * res = nullptr;
+        for (int64_t c = 0; c < nch; ++c) {
+            const int64_t rows = std::min(R, w->ne[1] - c * R);
+            struct ggml_tensor * wc = nch == 1 ? w : ggml_view_2d(ctx0, w, w->ne[0], rows, w->nb[1], c * R * w->nb[1]);
+            struct ggml_tensor * d  = nch == 1 ? rot->signs : ggml_view_1d(ctx0, rot->signs, rot->signs->ne[0], c * rot->signs->nb[1]);
+            struct ggml_tensor * yc = ggml_mul_mat(ctx0, wc, x);
+            yc->src[2] = d;
+            int32_t * op = (int32_t *) yc->op_params;
+            op[1] = (int32_t) rot->block_size;
+            op[2] = (int32_t) rot->perm_hd;
+            op[3] = (int32_t) rot->perm_nk;
+            op[4] = (int32_t) rot->perm_rep;
+            res = res ? ggml_concat(ctx0, res, yc, 0) : yc;
+        }
+        return llm_add_lora(lctx, ctx0, w, x, res);
+    }
+    if (auto rot = lctx.model.hadamard_rotation(w); rot != nullptr && rot->chunk_rows > 0) {
+        // TRL in slices (the head): each slice of rows has its own d, i.e. its own input rotation.
+        // The slices are aligned to the 64-row bands: the view of rows is a contiguous piece of the weight.
+        GGML_ASSERT(lctx.lora_adapters.empty());
+        const int64_t R = rot->chunk_rows, nch = (w->ne[1] + R - 1) / R;    // the last slice may be shorter
+        struct ggml_tensor * res = nullptr;
+        for (int64_t c = 0; c < nch; ++c) {
+            llama_hadamard_transform tc = *rot;
+            tc.signs = ggml_view_1d(ctx0, rot->signs, rot->signs->ne[0], c * rot->signs->nb[1]);
+            tc.chunk_rows = 0;
+            const int64_t rows = std::min(R, w->ne[1] - c * R);
+            struct ggml_tensor * wc = ggml_view_2d(ctx0, w, w->ne[0], rows, w->nb[1], c * R * w->nb[1]);
+            struct ggml_tensor * yc = ggml_mul_mat(ctx0, wc, llm_build_hadamard_rotate(ctx0, cur, tc));
+            res = res ? ggml_concat(ctx0, res, yc, 0) : yc;
+        }
+        return res;
+    }
     if (auto rot = lctx.model.hadamard_rotation(w); rot != nullptr) {
         // several folded weights consume the same input activation; rotate it once per graph.
         // Key by content (signs tensor + transform params), not by the per-weight transform pointer
@@ -1079,22 +1151,7 @@ ggml_tensor * llm_build_context::llm_build_lora_mm(
         }
     }
     struct ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
-    for (auto & it : lctx.lora_adapters) {
-        struct llama_lora_weight * lora = it.first->get_weight(w);
-        if (lora == nullptr) {
-            continue;
-        }
-        const float alpha = it.first->alpha;
-        const float rank  = (float) lora->b->ne[0];
-        const float scale = alpha ? it.second * alpha / rank : it.second;
-        struct ggml_tensor * ab_cur = ggml_mul_mat(
-            ctx0, lora->b,
-            ggml_mul_mat(ctx0, lora->a, cur)
-        );
-        ab_cur = ggml_scale(ctx0, ab_cur, scale);
-        res = ggml_add(ctx0, res, ab_cur);
-    }
-    return res;
+    return llm_add_lora(lctx, ctx0, w, cur, res);
 }
 
 ggml_tensor * llm_build_context::build_mla_output_gate(
@@ -2884,6 +2941,15 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             //ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
+            // The hidden states that the host rereads by name after the compute (embedding, MTP) must be outputs
+            // of the graph: otherwise the allocator reuses their memory as soon as the last consumer has finished. With a
+            // head of a single MUL_MAT the consumer is the last node and the data survives by chance; with the
+            // sliced trellis head (16 MUL_MAT + concat) the concats overwrite it and MTP receives wrong states
+            // (28/10: acceptance 3-6% instead of 81%).
+            if (strcmp(name, "result_norm") == 0 || strcmp(name, "result_embd") == 0 ||
+                strcmp(name, "result_mtp_embd") == 0) {
+                ggml_set_output(cur);
+            }
         }
 
         if (!lctx.cparams.offload_kqv) {
@@ -2896,7 +2962,13 @@ ggml_cgraph * llm_build_context::llama_build_graph(
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = lctx.model.n_gpu_layers > (int)lctx.model.hparams.n_layer;
-        if (batch.n_tokens < 32 || full_offload) {
+        // In prefill on the main GPU (llama_prefill_main_set) every layer node is computed there: the scheduler
+        // moves the products with the weights in RAM by itself, but not all the operations (SSM_CONV went to the CPU, with
+        // the activations back and forth).
+        if (lctx.prefill_main.active && il >= 0) {
+            ggml_backend_sched_set_tensor_backend(lctx.sched, cur, lctx.backends.front());
+        }
+        if ((batch.n_tokens < 32 || full_offload) && !lctx.prefill_main.active) {
             if (il != -1 && strcmp(name, "norm") == 0) {
                 for (auto * backend : lctx.backends) {
                     if (ggml_backend_supports_buft(backend, lctx.model.buft_layer[il].buft) &&

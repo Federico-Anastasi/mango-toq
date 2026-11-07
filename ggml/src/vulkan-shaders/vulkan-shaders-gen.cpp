@@ -511,6 +511,15 @@ void process_shaders() {
     string_to_spv("mul_mat_vec_p021_f16_f32",              "mul_mat_vec_p021.comp", {{"A_TYPE", "float16_t"}, {"A_TYPE_VEC4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}});
     string_to_spv("mul_mat_vec_nc_f16_f32", "mul_mat_vec_nc.comp", {{"A_TYPE", "float16_t"}, {"A_TYPE_VEC4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}});
 
+    // TRL weights (ggml-trl.h): input rotation, then the 2- or 3-bit product
+    string_to_spv("trl_prep_f32", "trl_prep.comp", {});
+    string_to_spv("mul_mat_vec_trl2_m_f32", "mul_mat_vec_trl.comp", {{"TRL_B", "2u"}});
+    string_to_spv("mul_mat_vec_trl3_m_f32", "mul_mat_vec_trl.comp", {{"TRL_B", "3u"}});
+
+    // DeltaNet (Qwen3.5/3.8): short convolution and recurrence, with ik's semantics (ggml_ssm_conv, ggml_delta_net)
+    string_to_spv("ssm_conv_f32", "ssm_conv.comp", {});
+    string_to_spv("delta_net_f32", "delta_net.comp", {});
+
     // Norms
     string_to_spv("norm_f32", "norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("group_norm_f32", "group_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
@@ -608,6 +617,8 @@ void process_shaders() {
     string_to_spv("tanh_f32",       "tanh.comp",        {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
     string_to_spv("sigmoid_f16",    "sigmoid.comp",     {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
     string_to_spv("sigmoid_f32",    "sigmoid.comp",     {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
+    string_to_spv("softplus_f16",   "softplus.comp",    {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
+    string_to_spv("softplus_f32",   "softplus.comp",    {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
 
     string_to_spv("geglu_f16",      "geglu.comp",       {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
     string_to_spv("geglu_f32",      "geglu.comp",       {{"A_TYPE", "float"},       {"D_TYPE", "float"}});

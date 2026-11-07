@@ -1,41 +1,50 @@
 #version 450
 
-#include "generic_head.comp"
-#include "types.comp"
+// GGML_OP_L2_NORM like on the CPU: y = x / max(|x|, eps) row by row. The input can be a view
+// (contiguous rows, any strides between rows), the output is contiguous.
 
 #extension GL_EXT_control_flow_attributes : enable
 #define BLOCK_SIZE 512
 
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
-layout (binding = 0) readonly buffer X {A_TYPE data_a[];};
-layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
+layout (binding = 0) readonly buffer X {float data_a[];};
+layout (binding = 1) writeonly buffer D {float data_d[];};
 
-shared FLOAT_TYPE sum[BLOCK_SIZE];
+layout (push_constant) uniform parameter {
+    uint ne0, ne1, ne2, nrows;
+    uint nb1, nb2, nb3;     // float
+    uint a_off, d_off;      // float
+    float eps;
+} p;
+
+shared float sum[BLOCK_SIZE];
 
 void main() {
-    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint row = gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    if (row >= p.nrows) {
+        return;
+    }
     const uint tid = gl_LocalInvocationID.x;
+    const uint i1 = row % p.ne1, i2 = (row / p.ne1) % p.ne2, i3 = row / (p.ne1 * p.ne2);
+    const uint a = p.a_off + i1 * p.nb1 + i2 * p.nb2 + i3 * p.nb3;
+    const uint d = p.d_off + row * p.ne0;
 
-    sum[tid] = FLOAT_TYPE(0.0f); // partial sum for thread in warp
-
-    [[unroll]] for (uint col = tid; col < p.KX; col += BLOCK_SIZE) {
-        const FLOAT_TYPE xi = FLOAT_TYPE(data_a[row*p.KX + col]);
+    sum[tid] = 0.0;
+    for (uint col = tid; col < p.ne0; col += BLOCK_SIZE) {
+        const float xi = data_a[a + col];
         sum[tid] += xi * xi;
     }
-
-    // sum up partial sums and write back result
     barrier();
-    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
         if (tid < s) {
             sum[tid] += sum[tid + s];
         }
         barrier();
     }
 
-    const FLOAT_TYPE scale = inversesqrt(max(sum[0], FLOAT_TYPE(p.param1)));
-
-    [[unroll]] for (uint col = tid; col < p.KX; col += BLOCK_SIZE) {
-        data_d[row*p.KX + col] = D_TYPE(scale * FLOAT_TYPE(data_a[row*p.KX + col]));
+    const float scale = 1.0 / max(sqrt(sum[0]), p.eps);
+    for (uint col = tid; col < p.ne0; col += BLOCK_SIZE) {
+        data_d[d + col] = scale * data_a[a + col];
     }
 }

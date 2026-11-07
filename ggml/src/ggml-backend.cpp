@@ -2729,7 +2729,13 @@ static void ggml_sched_prepare_graph(ggml_backend_sched_t sched) {
     for (auto & item : sched->own_cpy   ) item = false;
     for (auto & item : sched->needs_sync) item = true;
 
-    if (sched->split_mode_graph) {
+    // Own input memory for each part: copies between GPUs do not reuse allocator areas, so the CPU
+    // does not have to wait for the destination GPU before copying (ggml_backend_sched_copy_inputs). With the layer
+    // split: without it, every hop between GPUs stalled the CPU (32 per token on the 27B on 3060 + 1660) and
+    // the GPU sat idle while the CPU launched the next piece. For the layer split only if all the inputs fit
+    // without reusing the same area; otherwise stay synchronous.
+    const bool layer_own_inputs = !sched->split_mode_graph && sched->n_backends > 2 && getenv("GGML_SCHED_SYNC_INPUTS") == nullptr;
+    if (sched->split_mode_graph || layer_own_inputs) {
         auto tensor_size = [] (const ggml_tensor * t) {
             auto nbytes = ggml_nbytes(t);
             nbytes = 256*((nbytes + 255)/256);
@@ -2757,7 +2763,7 @@ static void ggml_sched_prepare_graph(ggml_backend_sched_t sched) {
                     }
                 }
                 if (input_size + this_size > sched->max_extra_alloc) {
-                    if (i - last_split < 3) {
+                    if (layer_own_inputs || i - last_split < 3) {
                         can_alloc = false;
                         break;
                     }

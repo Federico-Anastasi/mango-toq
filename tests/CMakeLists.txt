@@ -207,8 +207,16 @@ llama_build_and_test(
 )
 llama_build_and_test(test-regex-partial.cpp)
 
+llama_build_and_test(test-trl-cpu.cpp)
+llama_build_and_test(test-gelu-cpu.cpp)
+
 llama_build_and_test(test-iq4-ks-kt-decode.cpp)
 target_include_directories(test-iq4-ks-kt-decode PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
+# TRL product on the non-CPU backends (Vulkan, CUDA) against the CPU reference
+llama_build_and_test(test-trl-backend.cpp)
+# DeltaNet operations (Qwen3.5/3.8) on the non-CPU backends against the CPU
+llama_build_and_test(test-deltanet-backend.cpp)
 
 # llama_target_and_test(test-opt.cpp) # SLOW
 

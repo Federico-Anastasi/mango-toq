@@ -293,6 +293,7 @@ struct server_chat_params {
     int  reasoning_budget = -1;
     std::string reasoning_budget_message;
     bool force_pure_content = false;
+    bool cache_base = false; // compute cache_base_text for the disk cache
 };
 
 // used by /chat/completions endpoint
@@ -433,7 +434,7 @@ public:
 
     llama_tokens::const_iterator cend();
 
-    llama_tokens tokens_data();
+    llama_tokens tokens_data() const;
 
     // for compatibility with speculative decoding, ctx shift, slot save/load
     const std::vector<llama_token>& get_text_tokens() const;

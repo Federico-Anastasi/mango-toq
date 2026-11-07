@@ -198,6 +198,8 @@ struct create_tensors_helper : public create_tensors_helper_interface {
     void create_std_attn(int i, const LLM_TN & tn, llama_layer & layer, int n_embd, int n_embd_gqa, ggml_context * ctx_split);
     void create_std_ffn(int i, const LLM_TN & tn, llama_layer & layer, int n_ff, int n_embd, ggml_context * ctx_split);
 
+    void create_trl_lora(ggml_context * ctx, const std::string & wname, int64_t K, int64_t N, int flags);
+
     inline ggml_context * ctx_for_layer(int i) const {
         return ctx_map.at(model.buft_layer[i].buft);
     }
@@ -508,6 +510,35 @@ ggml_tensor * create_tensors_helper::create_tensor(ggml_context * ctx, const std
         split_tensors.insert(tensor);
     }
     return tensor;
+}
+
+// TRL: low-rank correction of the distillation inside the GGUF, as tensors
+// `<weight>.lora_a` (ne [K, r]) and `<weight>.lora_b` (ne [r, N]), the same names as a --lora adapter. They are created in the
+// context where the weight ended up (same GPU; no override by name to separate them) and llm_add_lora adds
+// b (a x) to the product, scale 1. A skipped weight (TENSOR_SKIP, e.g. the disabled MTP layer) also skips its own.
+void create_tensors_helper::create_trl_lora(ggml_context * ctx, const std::string & wname, int64_t K, int64_t N, int flags) {
+    const std::string na = wname + ".lora_a", nb = wname + ".lora_b";
+    const ggml_tensor * ma = ml.get_tensor_meta(na.c_str());
+    const ggml_tensor * mb = ml.get_tensor_meta(nb.c_str());
+    if (ma == nullptr && mb == nullptr) {
+        return;
+    }
+    if (ma == nullptr || mb == nullptr) {
+        throw std::runtime_error(format("TRL LoRA: %s has only one of lora_a and lora_b", wname.c_str()));
+    }
+    if (ml.get_tensor_meta(wname.c_str()) == nullptr) {
+        throw std::runtime_error(format("TRL LoRA: %s without its weight", na.c_str()));
+    }
+    if (ctx == split_ctx) {
+        throw std::runtime_error(format("TRL LoRA: %s with -sm graph/attn not supported", wname.c_str()));
+    }
+    const int64_t r = ma->ne[1];
+    const int skip = flags & llama_model_loader::TENSOR_SKIP;
+    ggml_tensor * a = ml.create_tensor(ctx, na, { K, r }, skip);
+    ggml_tensor * b = ml.create_tensor(ctx, nb, { r, N }, skip);
+    if (a != nullptr && b != nullptr) {
+        model.trl_lora[wname] = { a, b };
+    }
 }
 
 #define LOADING_PRELUDE \
@@ -2335,9 +2366,13 @@ bool create_tensors_helper::create_qwen35_tensors(const LLM_TN & tn) {
         }
 
         // 9B and 4B don't have MLP in MTP
-        layer.ffn_gate = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE, "weight", i), { n_embd, n_ff }, flags | mtp_opt);
-        layer.ffn_down = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN, "weight", i), { n_ff, n_embd }, flags | mtp_opt);
-        layer.ffn_up   = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,   "weight", i), { n_embd, n_ff }, flags | mtp_opt);
+        ggml_context * ctx_gate = nullptr, * ctx_down = nullptr, * ctx_up = nullptr;
+        layer.ffn_gate = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE, "weight", i), { n_embd, n_ff }, flags | mtp_opt, &ctx_gate);
+        layer.ffn_down = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN, "weight", i), { n_ff, n_embd }, flags | mtp_opt, &ctx_down);
+        layer.ffn_up   = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,   "weight", i), { n_embd, n_ff }, flags | mtp_opt, &ctx_up);
+        create_trl_lora(ctx_gate, tn(LLM_TENSOR_FFN_GATE, "weight", i), n_embd, n_ff, flags);
+        create_trl_lora(ctx_down, tn(LLM_TENSOR_FFN_DOWN, "weight", i), n_ff, n_embd, flags);
+        create_trl_lora(ctx_up,   tn(LLM_TENSOR_FFN_UP,   "weight", i), n_embd, n_ff, flags);
 
         // --- NextN / MTP tensors on the MTP layer ---
         if (is_mtp_layer) {

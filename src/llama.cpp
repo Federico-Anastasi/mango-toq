@@ -36,6 +36,10 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
+// hash of the state files (see llama_state_seq_save_file_hashed)
+#define XXH_INLINE_ALL
+#include "xxhash/xxhash.h"
+
 #include <cmath>
 
 void llama_set_mtp_target_context(struct llama_context * ctx, struct llama_context * target_ctx);
@@ -897,7 +901,11 @@ void llama_context::set_mtp_n_heads(int32_t value) {
     mtp_n_heads = std::max<int32_t>(0, value);
 }
 
+static void llama_prefill_main_release(llama_context & lctx);
+static void llama_prefill_main_add_lora(llama_context & lctx, const llama_lora_adapter * ad);
+
 llama_context::~llama_context() {
+    llama_prefill_main_release(*this);   // before the backends: its events are created on them
     if (dflash.kv.cache_sched != nullptr) {
         ggml_backend_sched_free(dflash.kv.cache_sched);
     }
@@ -1445,7 +1453,11 @@ static bool llama_kv_cache_init(
     const int n_mtp_first_layer = hparams.n_layer - hparams.nextn_predict_layers;
     for (int i = 0; i < (int) n_layer; i++) {
         // For MTP-only context, skip KV allocation for non-MTP layers
-        if (cparams.mtp_op_type != MTP_OP_NONE && i < n_mtp_first_layer) {
+        // And in the main context skip the cache of the MTP layers when MTP has its own context
+        // with its own cache (dense qwen35): the main graph never builds them (at 120k: 255 MB on the 3060)
+        const bool skip_mtp_in_main = cparams.mtp_op_type == MTP_OP_NONE && i >= n_mtp_first_layer &&
+                                      hparams.nextn_predict_layers > 0 && !llama_mtp_tail_uses_layer_cache(model);
+        if ((cparams.mtp_op_type != MTP_OP_NONE && i < n_mtp_first_layer) || skip_mtp_in_main) {
             cache.k_l.push_back(nullptr);
             if (!is_dsv4_k_only && model.arch != LLM_ARCH_OPENPANGU &&
                     (!is_mla_attn || !cparams.mla_attn || (cparams.mla_attn == 1 && !cparams.flash_attn))) {
@@ -2602,6 +2614,9 @@ static void llama_kv_cache_clear(struct llama_kv_cache & cache) {
 
     for (auto & buf : cache.bufs) {
         ggml_backend_buffer_clear(buf, 0);
+    }
+    if (cache.buf_prefill_main) {
+        ggml_backend_buffer_clear(cache.buf_prefill_main, 0);
     }
 }
 
@@ -4400,6 +4415,10 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
             // bias, we don't need to account for those
             continue;
         }
+        if (name.ends_with(".weight.lora_a") || name.ends_with(".weight.lora_b")) {
+            // TRL: LoRA inside the model (create_trl_lora), already counted in the layer; it is not a tensor type
+            continue;
+        }
         bool is_mla = false;
         if (has_mla) {
             if (name.find("attn_k_b.weight") != std::string::npos) {
@@ -4973,6 +4992,29 @@ static bool llm_load_tensors(
         if (n_gpu_layers > n_layer) {
             model.default_layer_device[n_layer] = mtp_device;
         }
+    }
+
+    // LLAMA_LAYER_DEVICES = "d0,d1,...,d<n_layer>": GPU of each layer and, last, of the output (indices among the
+    // GPUs in use). Replaces the split into contiguous blocks of -ts: it is needed to put non-contiguous layers
+    // on one GPU (e.g. all the full-attention layers, with their cache, on the only GPU with tensor cores).
+    if (const char * env = getenv("LLAMA_LAYER_DEVICES"); env && split_mode == LLAMA_SPLIT_MODE_LAYER && device_count > 0) {
+        std::vector<int> devs;
+        for (const char * p = env; *p; ) {
+            devs.push_back(atoi(p));
+            while (*p && *p != ',') ++p;
+            if (*p == ',') ++p;
+        }
+        if ((int) devs.size() != n_layer + 1) {
+            throw std::runtime_error(format("LLAMA_LAYER_DEVICES: %d values needed (layers + output), found %d",
+                                            n_layer + 1, (int) devs.size()));
+        }
+        for (int i = 0; i <= n_layer; ++i) {
+            if (devs[i] < 0 || devs[i] >= device_count) {
+                throw std::runtime_error(format("LLAMA_LAYER_DEVICES: GPU %d out of range (layer %d)", devs[i], i));
+            }
+            model.default_layer_device[i] = devs[i];
+        }
+        LLAMA_LOG_INFO("%s: LLAMA_LAYER_DEVICES = %s\n", __func__, env);
     }
 
     // assign the repeating layers to the devices according to the splits
@@ -5554,6 +5596,9 @@ static bool llm_load_tensors(
 
     // Prism ternary Hadamard rotations
     llm_load_hadamard(ml, model);
+
+    // TRL: input rotation per tensor
+    llm_load_trl(ml, model);
 
     // loading time will be recalculate after the first eval, so
     // we take page faults deferred by mmap() into consideration
@@ -6982,7 +7027,8 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         }
     }
 
-    if (lctx.inp_s_seq_qnext) {
+    // not allocated when no node reads it (the batched delta_net path uses inp_s_slots/inp_s_seq_multi)
+    if (lctx.inp_s_seq_qnext && lctx.inp_s_seq_qnext->buffer) {
         const int64_t n_tokens = batch.n_tokens;
 
         GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_s_seq_qnext->buffer));
@@ -6991,6 +7037,28 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         for (int64_t j = 0; j < n_tokens; ++j) {
             // qwen3next and openPangu use a single local recurrent state slot.
             data[j] = 0;
+        }
+    }
+
+    if (lctx.inp_s_slots) {
+        const int64_t n_tokens = batch.n_tokens;
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_s_slots->buffer));
+        GGML_ASSERT(batch.seq_id != nullptr);
+        int32_t * data = (int32_t *) lctx.inp_s_slots->data;
+        for (int64_t j = 0; j < n_tokens; ++j) {
+            data[j] = batch.seq_id[j][0];
+        }
+    }
+
+    if (lctx.inp_s_seq_multi) {
+        const int64_t n_tokens = batch.n_tokens;
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_s_seq_multi->buffer));
+        int32_t * data = (int32_t *) lctx.inp_s_seq_multi->data;
+        // the states are gathered in token order, so token j reads and writes local state j
+        for (int64_t j = 0; j < n_tokens; ++j) {
+            for (int64_t i = 0; i < n_tokens; ++i) {
+                data[j*n_tokens + i] = i == 0 ? (int32_t) j : -1;
+            }
         }
     }
 
@@ -7329,6 +7397,428 @@ static bool prepare_mtp_graph_inputs(
     return true;
 }
 
+// Prompt prefill entirely on the main GPU (CUDA 0), with the layer split.
+// Split by layers, prefill is limited by the compute of the weakest GPU: 3060 + 1660 S gave 136 tokens/s
+// with the 3060 working 5% of the time. Prefill is compute-bound, decode is bandwidth-bound: the weights stay
+// where decode reads them and, for large batches, are brought to the GPU that computes.
+// For batches >= LLAMA_PREFILL_MAIN_MIN tokens (default 256; 0 = off) the tensors of the layers that live on other
+// GPUs point to copies on the main GPU:
+//   - large weights (the linear ones): two slots in turn; while the GPU computes remote layer r, a second stream copies
+//     the weights of layer r+1 into the other slot from pinned RAM;
+//   - small weights (norms, DeltaNet parameters, TRL rotation vectors): fixed copy;
+//   - recurrent states: copy on the main GPU. On entering prefill they all leave home together and each
+//     layer waits only for its own; after each layer the updated state goes back home while the following
+//     layers are computed, so the return to decode copies nothing (the 1660's link is x1: 0.8 GB/s).
+// Coordination goes through CUDA events attached to the "l_out" output of each layer with the scheduler callback,
+// without stopping the CPU. All the code reads the same tensor objects, so it stays coherent; the result is
+// identical to the main GPU alone (perplexity 6.9782 in both cases).
+static void llama_prefill_main_init(llama_context & lctx) {
+    auto & pm = lctx.prefill_main;
+    pm.inited = true;
+#ifdef GGML_USE_CUDA
+    const char * env = getenv("LLAMA_PREFILL_MAIN_MIN");
+    pm.min_tokens = env ? atoi(env) : 128;
+    if (pm.min_tokens <= 0 || lctx.model.split_mode != LLAMA_SPLIT_MODE_LAYER || lctx.backends.empty() ||
+        !ggml_backend_is_cuda(lctx.backends.front())) {
+        pm.min_tokens = 0;
+        return;
+    }
+    if (lctx.cparams.cb_eval != nullptr) {
+        LLAMA_LOG_INFO("%s: user evaluation callback present: prefill on the main GPU off\n", __func__);
+        pm.min_tokens = 0;
+        return;
+    }
+    if (lctx.model.prefill_main_owner != nullptr && lctx.model.prefill_main_owner != &lctx) {
+        LLAMA_LOG_INFO("%s: another context already uses prefill on the main GPU on this model: off\n", __func__);
+        pm.min_tokens = 0;
+        return;
+    }
+    constexpr size_t BIG = 4u << 20;               // above: linear weights streamed; below: fixed copy
+    ggml_backend_buffer_type_t main_buft = ggml_backend_cuda_buffer_type(0);
+    auto is_remote = [&](const ggml_tensor * t) {
+        return t != nullptr && t->buffer != nullptr && t->extra == nullptr && t->view_src == nullptr &&
+               !ggml_backend_buffer_is_host(t->buffer) && ggml_backend_buffer_get_type(t->buffer) != main_buft;
+    };
+    const int n_layer = (int) lctx.model.hparams.n_layer;
+    std::vector<std::vector<ggml_tensor *>> big(n_layer);
+    std::vector<ggml_tensor *> small;
+    std::set<const ggml_tensor *> seen;
+    for (const auto & it : lctx.model.tensors_by_name) {
+        ggml_tensor * t = it.second;
+        if (!is_remote(t) || !seen.insert(t).second) continue;
+        int il = -1;
+        if (sscanf(it.first.c_str(), "blk.%d.", &il) == 1 && il >= 0 && il < n_layer && ggml_nbytes(t) >= BIG) {
+            big[il].push_back(t);
+        } else if (ggml_nbytes(t) < BIG) {
+            small.push_back(t);
+        } else {
+            // large and outside the layers (e.g. the head on another GPU): stays there, and so does its operation
+            continue;
+        }
+        if (auto rot = lctx.model.hadamard_rotation(t); rot != nullptr && is_remote(rot->signs) && seen.insert(rot->signs).second) {
+            small.push_back(rot->signs);
+        }
+    }
+    std::vector<int> sl_layer;
+    for (int il = 0; il < (int) lctx.kv_self.s_l.size() && il < n_layer; ++il) {
+        if (is_remote(lctx.kv_self.s_l[il])) sl_layer.push_back(il);
+    }
+    pm.rank_of_layer.assign(n_layer, -1);
+    pm.state_of_layer.assign(n_layer, -1);
+    std::vector<int> rank_layer;
+    for (int il = 0; il < n_layer; ++il) {
+        if (!big[il].empty()) { pm.rank_of_layer[il] = (int) rank_layer.size(); rank_layer.push_back(il); }
+    }
+    if (rank_layer.empty() && small.empty() && sl_layer.empty()) {
+        pm.min_tokens = 0;
+        return;
+    }
+    for (int il = 0; il < (int) lctx.kv_self.k_l.size(); ++il) {
+        if (is_remote(lctx.kv_self.k_l[il]) || (il < (int) lctx.kv_self.v_l.size() && is_remote(lctx.kv_self.v_l[il]))) {
+            LLAMA_LOG_WARN("%s: the KV cache of layer %d is not on the main GPU: its attention goes between "
+                           "GPUs even in prefill\n", __func__, il);
+        }
+    }
+    const size_t hal = ggml_backend_buft_get_alignment(ggml_backend_cuda_host_buffer_type());
+    const size_t dal = ggml_backend_buft_get_alignment(main_buft);
+    auto asize = [](const ggml_tensor * t, size_t al) { return GGML_PAD(ggml_backend_buffer_get_alloc_size(t->buffer, t), al); };
+    // layout: RAM (large, in a row; transit of the states), GPU (small, 2 slots as large as the biggest
+    // remote layer; states)
+    size_t htot = 0, small_tot = 0, slot = 0, stot = 0, sttot = 0;
+    std::vector<size_t> hoff_rank(rank_layer.size());
+    for (size_t r = 0; r < rank_layer.size(); ++r) {
+        hoff_rank[r] = htot;
+        size_t s = 0;
+        for (ggml_tensor * t : big[rank_layer[r]]) { htot += asize(t, hal); s += asize(t, dal); }
+        slot = std::max(slot, s);
+    }
+    for (ggml_tensor * t : small) small_tot += asize(t, dal);
+    const size_t dtot = small_tot + 2 * slot;
+    for (int il : sl_layer) { stot += asize(lctx.kv_self.s_l[il], dal); sttot += GGML_PAD(ggml_nbytes(lctx.kv_self.s_l[il]), hal); }
+
+    const int64_t t0 = ggml_time_us();
+    auto fail = [&](const char * what, size_t bytes) {
+        LLAMA_LOG_ERROR("%s: not enough memory (%s, %.1f MiB): prefill on the main GPU off\n", __func__, what, bytes / 1048576.0);
+        for (auto * b : pm.hbufs) ggml_backend_buffer_free(b);
+        pm.hbufs.clear();
+        for (auto * b : { pm.dbuf, pm.sbuf, pm.stbuf }) if (b) ggml_backend_buffer_free(b);
+        pm.dbuf = pm.sbuf = pm.stbuf = nullptr;
+        lctx.kv_self.buf_prefill_main = nullptr;
+        pm.weights.clear(); pm.states.clear(); pm.rank_copies.clear();
+        pm.min_tokens = 0;
+    };
+    for (size_t r = 0; r < rank_layer.size(); ++r) {
+        const size_t sz = (r + 1 < rank_layer.size() ? hoff_rank[r + 1] : htot) - hoff_rank[r];
+        ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_host_buffer_type(), sz);
+        if (!b) return fail("pinned RAM, weights", htot);
+        pm.hbufs.push_back(b);
+    }
+    if (sttot > 0 && !(pm.stbuf = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_host_buffer_type(), sttot))) return fail("pinned RAM, states", sttot);
+    if (dtot  > 0 && !(pm.dbuf  = ggml_backend_buft_alloc_buffer(main_buft, dtot)))  return fail("weights on the main GPU", dtot);
+    if (stot  > 0 && !(pm.sbuf  = ggml_backend_buft_alloc_buffer(main_buft, stot)))  return fail("states on the main GPU", stot);
+    // the RAM must really be pinned: if the allocation falls back to normal memory the copies become synchronous
+    std::vector<ggml_backend_buffer_t> pinned = pm.hbufs;
+    if (pm.stbuf) pinned.push_back(pm.stbuf);
+    for (auto * b : pinned) {
+        if (b && ggml_backend_buffer_get_type(b) != ggml_backend_cuda_host_buffer_type()) return fail("RAM not pinned", htot + sttot);
+    }
+
+    char * dbase = pm.dbuf ? (char *) ggml_backend_buffer_get_base(pm.dbuf) : nullptr;
+    if (pm.dbuf) ggml_backend_buffer_clear(pm.dbuf, 0);   // also zeroes the padding between tensors
+    std::vector<uint8_t> tmp;
+    size_t doff = 0;
+    for (ggml_tensor * t : small) {                       // fixed copy on the main GPU
+        tmp.resize(ggml_nbytes(t));
+        ggml_backend_tensor_get(t, tmp.data(), 0, tmp.size());
+        ggml_tensor alt = *t;
+        alt.data = dbase + doff; alt.buffer = pm.dbuf;
+        ggml_backend_tensor_set(&alt, tmp.data(), 0, tmp.size());
+        pm.weights.push_back({ t, t->data, t->buffer, alt.data, pm.dbuf });
+        doff += asize(t, dal);
+    }
+    char * slot_base[2] = { dbase + small_tot, dbase + small_tot + slot };
+    {
+        for (size_t r = 0; r < rank_layer.size(); ++r) {
+            auto & cp = pm.rank_copies.emplace_back();
+            char * hbase = (char *) ggml_backend_buffer_get_base(pm.hbufs[r]);
+            memset(hbase, 0, ggml_backend_buffer_get_size(pm.hbufs[r]));
+            size_t ho = 0, so = 0;
+            for (ggml_tensor * t : big[rank_layer[r]]) {
+                ggml_backend_tensor_get(t, hbase + ho, 0, ggml_nbytes(t));
+                pm.weights.push_back({ t, t->data, t->buffer, slot_base[r & 1] + so, pm.dbuf });
+                cp.emplace_back(t, hbase + ho);
+                ho += asize(t, hal);
+                so += asize(t, dal);
+            }
+        }
+    }
+    if (!pm.rank_copies.empty() || !sl_layer.empty()) {
+        pm.copy_be  = ggml_backend_cuda_init(0, nullptr, nullptr);
+        pm.state_be = ggml_backend_cuda_init(0, nullptr, nullptr);
+        pm.ev_copied[0] = ggml_backend_event_new(pm.copy_be);
+        pm.ev_copied[1] = ggml_backend_event_new(pm.copy_be);
+        pm.ev_free = ggml_backend_event_new(lctx.backends.front());
+        if (!pm.copy_be || !pm.state_be || !pm.ev_copied[0] || !pm.ev_copied[1] || !pm.ev_free) return fail("CUDA streams/events", 0);
+    }
+    if (pm.sbuf) {
+        ggml_backend_buffer_clear(pm.sbuf, 0);
+        lctx.kv_self.buf_prefill_main = pm.sbuf;
+        char * sbase  = (char *) ggml_backend_buffer_get_base(pm.sbuf);
+        char * stbase = (char *) ggml_backend_buffer_get_base(pm.stbuf);
+        std::map<ggml_backend_buffer_type_t, ggml_backend_t> be_of;   // one stream per home GPU
+        size_t so = 0, sto = 0;
+        for (int il : sl_layer) {
+            ggml_tensor * t = lctx.kv_self.s_l[il];
+            pm.state_of_layer[il] = (int) pm.states.size();
+            pm.states.push_back({ t, t->data, t->buffer, sbase + so, pm.sbuf });
+            auto & io = pm.sio.emplace_back();
+            io.host = stbase + sto;
+            ggml_backend_buffer_type_t hb = ggml_backend_buffer_get_type(t->buffer);
+            if (!be_of.count(hb)) {
+                // the context's compute stream on that GPU: no extra CUDA context on the small GPU
+                // (the 1660 has 6 GB); the state copies happen when nothing is computed there (in prefill)
+                ggml_backend_t found = nullptr;
+                for (auto * be : lctx.backends) {
+                    if (ggml_backend_is_cuda(be) && ggml_backend_supports_buft(be, hb)) { found = be; break; }
+                }
+                GGML_ASSERT(found != nullptr);
+                be_of[hb] = found;
+                pm.dev_be.push_back(found);
+            }
+            io.home_be = be_of[hb];
+            io.in   = ggml_backend_event_new(io.home_be);
+            io.sh   = ggml_backend_event_new(pm.state_be);
+            io.done = ggml_backend_event_new(lctx.backends.front());
+            io.out  = ggml_backend_event_new(pm.state_be);
+            io.home = ggml_backend_event_new(io.home_be);
+            if (!io.home_be || !io.in || !io.sh || !io.done || !io.out || !io.home) return fail("CUDA streams/events of the states", 0);
+            so  += asize(t, dal);
+            sto += GGML_PAD(ggml_nbytes(t), hal);
+        }
+    }
+    lctx.model.prefill_main_owner = &lctx;
+    // line in the engine's buffer format, so tools that sum the buffers from the log count it too
+    LLAMA_LOG_INFO("%s: CUDA0 buffer size = %8.2f MiB (prefill on the main GPU)\n", __func__, (dtot + stot) / 1048576.0);
+    LLAMA_LOG_INFO("%s: batches >= %d tokens all on the main GPU: %zu layers streamed from pinned RAM "
+                   "(%.1f MiB, 2 slots of %.1f MiB), %zu small fixed weights (%.1f MiB), %zu states (%.1f MiB); %.1f s\n",
+                   __func__, pm.min_tokens, rank_layer.size(), htot / 1048576.0, slot / 1048576.0, small.size(),
+                   small_tot / 1048576.0, pm.states.size(), stot / 1048576.0, (ggml_time_us() - t0) / 1e6);
+    for (auto & [ad, sc] : lctx.lora_adapters) llama_prefill_main_add_lora(lctx, ad);   // activated before this point
+#else
+    pm.min_tokens = 0;
+#endif
+}
+
+#ifdef GGML_USE_CUDA
+// descriptor of a state's home copy (the real tensor, in prefill, points to the copy on the main GPU)
+static ggml_tensor llama_prefill_main_home(const llama_context::prefill_main_t::swap_t & s) {
+    ggml_tensor h = *s.t;
+    h.data = s.home_data;
+    h.buffer = s.home_buf;
+    return h;
+}
+
+// copy of the large weights of the remote layer of rank r into its slot (r & 1), on the weights stream
+static void llama_prefill_main_copy(llama_context & lctx, int r) {
+    auto & pm = lctx.prefill_main;
+    if (r >= (int) pm.rank_copies.size()) return;
+    for (auto & [t, src] : pm.rank_copies[r]) {
+        ggml_backend_tensor_set_async(pm.copy_be, t, src, 0, ggml_nbytes(t));
+    }
+    ggml_backend_event_record(pm.ev_copied[r & 1]);
+}
+
+// before computing layer nl: its large weights and its state must have arrived
+static void llama_prefill_main_pre_layer(llama_context & lctx, int nl) {
+    auto & pm = lctx.prefill_main;
+    ggml_backend_t compute = lctx.backends.front();
+    if (const int r = pm.rank_of_layer[nl]; r >= 0) {
+        const int R = (int) pm.rank_copies.size();
+        if (r >= 1) {                                     // the other slot is free: layer r-1 is done
+            ggml_backend_event_record(pm.ev_free);
+            ggml_backend_event_wait(pm.copy_be, pm.ev_free);
+            if (r + 1 < R) {
+                llama_prefill_main_copy(lctx, r + 1);
+            } else if (R % 2 == 0) {                      // ring: rank 0 of the next batch, in slot 0
+                llama_prefill_main_copy(lctx, 0);
+                pm.prefetched = true;
+            }
+        }
+        ggml_backend_event_wait(compute, pm.ev_copied[r & 1]);
+    }
+    if (const int j = pm.state_of_layer[nl]; j >= 0) {
+        auto & io = pm.sio[j];
+        if (io.pend_in) {                                 // first batch in prefill: the state arrives from home
+            ggml_backend_event_wait(compute, io.sh);
+            io.pend_in = false;
+        } else if (io.out_valid) {                        // do not overwrite it before it has left (previous batch)
+            ggml_backend_event_wait(compute, io.out);
+        }
+    }
+}
+
+// after computing layer il: the updated state goes back home, on the states streams
+static void llama_prefill_main_post_layer(llama_context & lctx, int il) {
+    auto & pm = lctx.prefill_main;
+    const int j = pm.state_of_layer[il];
+    if (j < 0) return;
+    auto & io = pm.sio[j];
+    auto & s = pm.states[j];
+    const size_t n = ggml_nbytes(s.t);
+    ggml_backend_event_record(io.done);
+    ggml_backend_event_wait(pm.state_be, io.done);
+    if (io.home_valid) ggml_backend_event_wait(pm.state_be, io.home);   // transit free: previous copy home finished
+    ggml_backend_tensor_get_async(pm.state_be, s.t, io.host, 0, n);
+    ggml_backend_event_record(io.out);
+    io.out_valid = true;
+    ggml_backend_event_wait(io.home_be, io.out);
+    ggml_tensor h = llama_prefill_main_home(s);
+    ggml_backend_tensor_set_async(io.home_be, &h, io.host, 0, n);
+    ggml_backend_event_record(io.home);
+    io.home_valid = true;
+}
+
+// Attached to the output of each layer (node "l_out-<il>"): the state of layer il leaves, the weights and state
+// of layer il+1 arrive.
+static int llama_prefill_main_cb(ggml_tensor * t, bool ask, void * user_data) {
+    auto & lctx = *(llama_context *) user_data;
+    auto & pm = lctx.prefill_main;
+    const char * nm = ggml_get_name(t);
+    if (strncmp(nm, "l_out-", 6) != 0) return ask ? 0 : 1;
+    const int il = atoi(nm + 6), nl = il + 1;
+    const int n = (int) pm.rank_of_layer.size();
+    const bool post = il >= 0 && il < n && pm.state_of_layer[il] >= 0;
+    const bool pre  = nl < n && (pm.rank_of_layer[nl] >= 0 || pm.state_of_layer[nl] >= 0);
+    if (ask) return post || pre ? 2 : 0;                  // 2: stop here, without synchronizing the CPU
+    static const int dbg = getenv("LLAMA_PREFILL_MAIN_TRACE") ? atoi(getenv("LLAMA_PREFILL_MAIN_TRACE")) : 0;
+    if (dbg) {                                            // diagnosis: CPU instant and (with 2) end of the compute so far
+        static int64_t tp = 0;
+        const int64_t a = ggml_time_us();
+        if (dbg == 2) ggml_backend_synchronize(lctx.backends.front());
+        const int64_t b = ggml_time_us();
+        LLAMA_LOG_INFO("pm l_out-%d: cpu +%.1f ms, GPU wait %.1f ms\n", il, (a - tp) / 1e3, (b - a) / 1e3);
+        tp = ggml_time_us();
+    }
+    if (post) llama_prefill_main_post_layer(lctx, il);
+    if (pre)  llama_prefill_main_pre_layer(lctx, nl);
+    return 1;
+}
+#endif
+
+// Before computing each batch in prefill: the slots are free once the previous batch has finished; the
+// first two remote layers are copied; if layer 0 is remote, the compute waits for it here.
+static void llama_prefill_main_prologue(llama_context & lctx, bool fresh) {
+#ifdef GGML_USE_CUDA
+    auto & pm = lctx.prefill_main;
+    if (!pm.active) return;
+    if (pm.need_in) {
+        // Entry of the states, emitted here and not in set(): so no synchronization of the graph build/allocation
+        // waits for it. New prompt (fresh: position 0, one slot): the graph zeroes the state, no need to copy it.
+        for (size_t j = 0; j < pm.states.size(); ++j) {
+            auto & s = pm.states[j];
+            auto & io = pm.sio[j];
+            io.out_valid = io.home_valid = false;
+            io.pend_in = !fresh;
+            if (fresh) continue;
+            const size_t n = ggml_nbytes(s.t);
+            ggml_tensor h = llama_prefill_main_home(s);
+            ggml_backend_tensor_get_async(io.home_be, &h, io.host, 0, n);
+            ggml_backend_event_record(io.in);
+            ggml_backend_event_wait(pm.state_be, io.in);
+            ggml_backend_tensor_set_async(pm.state_be, s.t, io.host, 0, n);
+            ggml_backend_event_record(io.sh);
+        }
+        pm.need_in = false;
+    }
+    if (!pm.rank_copies.empty()) {
+        ggml_backend_event_record(pm.ev_free);
+        ggml_backend_event_wait(pm.copy_be, pm.ev_free);
+        if (!pm.prefetched) llama_prefill_main_copy(lctx, 0);
+        llama_prefill_main_copy(lctx, 1);
+        pm.prefetched = false;
+    }
+    if (!pm.rank_of_layer.empty() && (pm.rank_of_layer[0] >= 0 || pm.state_of_layer[0] >= 0)) {
+        llama_prefill_main_pre_layer(lctx, 0);       // layer 0 has no "l_out" before it (rank 0: no new copy)
+    }
+#else
+    GGML_UNUSED(lctx); GGML_UNUSED(fresh);
+#endif
+}
+
+static void llama_prefill_main_set(llama_context & lctx, bool on) {
+    auto & pm = lctx.prefill_main;
+    if (pm.min_tokens <= 0 || on == pm.active) {
+        return;
+    }
+#ifdef GGML_USE_CUDA
+    static const bool tlog = getenv("LLAMA_PREFILL_MAIN_LOG") != nullptr;
+    const int64_t t0 = ggml_time_us();
+    ggml_backend_sched_synchronize(lctx.sched);
+    const int64_t t1 = ggml_time_us();
+    for (auto * be : { pm.copy_be, pm.state_be }) if (be) ggml_backend_synchronize(be);
+    for (auto * be : pm.dev_be) ggml_backend_synchronize(be);  // on exit: all the states have already arrived home
+    for (size_t j = 0; j < pm.states.size(); ++j) {
+        auto & s = pm.states[j];
+        auto & io = pm.sio[j];
+        s.t->data   = on ? s.alt_data : s.home_data;
+        s.t->buffer = on ? s.alt_buf  : s.home_buf;
+        io.pend_in = false;
+        io.out_valid = io.home_valid = false;
+    }
+    for (auto & s : pm.weights) {
+        s.t->data   = on ? s.alt_data : s.home_data;
+        s.t->buffer = on ? s.alt_buf  : s.home_buf;
+    }
+    for (auto & [ad, s] : pm.lora_weights) {
+        s.t->data   = on ? s.alt_data : s.home_data;
+        s.t->buffer = on ? s.alt_buf  : s.home_buf;
+    }
+    pm.need_in = on && !pm.states.empty();
+    pm.prefetched = false;
+    pm.active = on;
+    if (tlog) {
+        LLAMA_LOG_INFO("prefill_main %s: compute wait %.1f ms, switch %.1f ms\n", on ? "ON " : "OFF",
+                       (t1 - t0) / 1e3, (ggml_time_us() - t1) / 1e3);
+    }
+#else
+    GGML_UNUSED(lctx);
+#endif
+}
+
+static void llama_prefill_main_release(llama_context & lctx) {
+    auto & pm = lctx.prefill_main;
+#ifdef GGML_USE_CUDA
+    for (auto * be : { pm.copy_be, pm.state_be }) if (be) ggml_backend_synchronize(be);
+    for (auto * be : pm.dev_be) ggml_backend_synchronize(be);   // the state outputs have arrived home
+    if (pm.active) {
+        for (auto & s : pm.weights) { s.t->data = s.home_data; s.t->buffer = s.home_buf; }
+        for (auto & [ad, s] : pm.lora_weights) { s.t->data = s.home_data; s.t->buffer = s.home_buf; }
+        for (auto & s : pm.states)  { s.t->data = s.home_data; s.t->buffer = s.home_buf; }
+        pm.active = false;
+    }
+    for (auto * e : { pm.ev_copied[0], pm.ev_copied[1], pm.ev_free }) if (e) ggml_backend_event_free(e);
+    pm.ev_copied[0] = pm.ev_copied[1] = pm.ev_free = nullptr;
+    for (auto & s : pm.sio) for (auto * e : { s.in, s.sh, s.done, s.out, s.home }) if (e) ggml_backend_event_free(e);
+    pm.sio.clear();
+    // dev_be are the context's backends: they are not freed here
+    pm.dev_be.clear();
+    if (pm.copy_be)  { ggml_backend_free(pm.copy_be);  pm.copy_be = nullptr; }
+    if (pm.state_be) { ggml_backend_free(pm.state_be); pm.state_be = nullptr; }
+    for (auto * b : pm.hbufs) ggml_backend_buffer_free(b);
+    pm.hbufs.clear();
+    for (auto ** b : { &pm.dbuf, &pm.sbuf, &pm.stbuf }) if (*b) { ggml_backend_buffer_free(*b); *b = nullptr; }
+    lctx.kv_self.buf_prefill_main = nullptr;
+    pm.weights.clear(); pm.states.clear(); pm.rank_copies.clear();
+    pm.lora_weights.clear();
+    for (auto & [ad, b] : pm.lora_bufs) ggml_backend_buffer_free(b);
+    pm.lora_bufs.clear();
+    if (lctx.model.prefill_main_owner == &lctx) lctx.model.prefill_main_owner = nullptr;
+    pm.min_tokens = 0;
+#else
+    GGML_UNUSED(pm);
+#endif
+}
+
 // decode a batch of tokens by evaluating the transformer
 //
 //   - lctx:      llama context
@@ -7473,9 +7963,23 @@ static int llama_decode_internal(
             }
 
             if (can_check && any_diff && has_dup) {
-                n_tokens = 1;
+                // A recurrent state cannot take two tokens of one sequence in a mixed ubatch. Instead of
+                // one token per ubatch, cut the longest leading run that is valid on its own: tokens of
+                // distinct sequences (the decode tokens of the generating slots, one batched step) or
+                // tokens of a single sequence (a prompt chunk).
+                uint32_t run_unique = 0, run_same = 0;
+                {
+                    std::unordered_set<llama_seq_id> seen;
+                    while (run_unique < n_tokens && seen.insert(batch_all.seq_id[cur_token + run_unique][0]).second) {
+                        ++run_unique;
+                    }
+                    while (run_same < n_tokens && batch_all.seq_id[cur_token + run_same][0] == first_seq_id) {
+                        ++run_same;
+                    }
+                }
+                n_tokens = std::max<uint32_t>(1, std::max(run_unique, run_same));
                 if (!warned_qnext_mixed_repeat) {
-                    LLAMA_LOG_WARN("%s: qwen3next mixed-sequence batch contains repeated seq_id values; falling back to single-token chunking\n", __func__);
+                    LLAMA_LOG_INFO("%s: qwen3next mixed-sequence batch with repeated seq_id values: split into runs of distinct or of equal sequences\n", __func__);
                     warned_qnext_mixed_repeat = true;
                 }
             }
@@ -7628,11 +8132,20 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING
         tim1 = ggml_time_us();
 #endif
+        if (cparams.mtp_op_type == MTP_OP_NONE) {
+            if (!lctx.prefill_main.inited) {
+                llama_prefill_main_init(lctx);
+            }
+            llama_prefill_main_set(lctx, lctx.prefill_main.min_tokens > 0 && (int) u_batch.n_tokens >= lctx.prefill_main.min_tokens);
+        }
         auto & prev = cparams.mtp_op_type == MTP_OP_NONE ? lctx.prev : lctx.prev_mtp;
         ggml_cgraph * gf = nullptr;
         const uint64_t seq_fingerprint = llama_ubatch_seq_fingerprint(u_batch, lctx.model.arch);
         const uint64_t state_hash      = model_state_hash(lctx);
+        const int64_t pm_t0 = ggml_time_us();
+        bool pm_rebuilt = false;
         if (!lctx.can_reuse_graph(u_batch, seq_fingerprint, state_hash)) {
+            pm_rebuilt = true;
             lctx.reset_scheduler();
             ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
 #if IK_PRINT_TIMING
@@ -7759,7 +8272,27 @@ static int llama_decode_internal(
         tim1 = ggml_time_us();
 #endif
         //fprintf(stderr, "%s: invoking llama_graph_compute\n", __func__);
+        if (cparams.mtp_op_type == MTP_OP_NONE && lctx.prefill_main.min_tokens > 0) {
+            // the callback is set again at every batch: a reused graph may come from before an MTP graph
+#ifdef GGML_USE_CUDA
+            if (lctx.prefill_main.active && (!lctx.prefill_main.rank_copies.empty() || !lctx.prefill_main.states.empty())) {
+                ggml_backend_sched_set_eval_callback(lctx.sched, llama_prefill_main_cb, &lctx);
+            } else
+#endif
+            {
+                ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
+            }
+            const bool fresh = u_batch.pos != nullptr && u_batch.pos[0] == 0 && !lctx.prefill_main.states.empty() &&
+                               lctx.prefill_main.states.front().t->ne[1] == 1;
+            llama_prefill_main_prologue(lctx, fresh);
+        }
+        const int64_t pm_t1 = ggml_time_us();
         llama_graph_compute(lctx, gf, n_threads);
+        if (lctx.prefill_main.active && getenv("LLAMA_PREFILL_MAIN_LOG")) {
+            ggml_backend_sched_synchronize(lctx.sched);
+            LLAMA_LOG_INFO("prefill_main batch %d tokens: graph %s %.1f ms, compute %.1f ms\n", (int) u_batch.n_tokens,
+                           pm_rebuilt ? "new" : "reused", (pm_t1 - pm_t0) / 1e3, (ggml_time_us() - pm_t1) / 1e3);
+        }
 
         if (llm_arch_is_dsv4(lctx.model.arch) &&
             llama_dsv4_per_step_capture_active(lctx) &&
@@ -8507,6 +9040,7 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
     }
 
     if ((lctx.kv_self.recurrent || llama_kv_has_qnext_state_storage(lctx.kv_self)) && lctx.kv_self.do_copy) {
+        llama_prefill_main_set(lctx, false);   // copies between sequences write the states at home
         {
             lctx.reset_scheduler();
 
@@ -8752,15 +9286,78 @@ static void llama_lora_adapter_init_internal(struct llama_model * model, const c
     ggml_free(ctx);
 }
 
+// In prefill on the main GPU the remote layers are computed on the main one: without a copy
+// there, the LoRA tensors of those layers would be copied from the remote GPU at every layer and every batch (prefill
+// -33% on the 27B with 48 layers on the 1660). Fixed copy on the main one, swapped like the small weights.
+static void llama_prefill_main_add_lora(llama_context & lctx, const llama_lora_adapter * ad) {
+#ifdef GGML_USE_CUDA
+    auto & pm = lctx.prefill_main;
+    if (!pm.inited || pm.min_tokens <= 0) return;
+    for (auto & [a, b] : pm.lora_bufs) if (a == ad) return;          // already done (the server reactivates it at every request)
+    ggml_backend_buffer_type_t main_buft = ggml_backend_cuda_buffer_type(0);
+    std::vector<ggml_tensor *> rem;
+    for (const auto & [name, w] : ad->ab_map) {
+        for (ggml_tensor * t : { w.a, w.b }) {
+            if (t && t->buffer && !ggml_backend_buffer_is_host(t->buffer) && ggml_backend_buffer_get_type(t->buffer) != main_buft) {
+                rem.push_back(t);
+            }
+        }
+    }
+    if (rem.empty()) return;
+    const size_t dal = ggml_backend_buft_get_alignment(main_buft);
+    size_t tot = 0;
+    for (ggml_tensor * t : rem) tot += GGML_PAD(ggml_backend_buffer_get_alloc_size(t->buffer, t), dal);
+    ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(main_buft, tot);
+    if (!b) {
+        LLAMA_LOG_WARN("%s: not enough memory for the LoRA copy on the main GPU (%.1f MiB): prefill "
+                       "will copy the LoRA from the remote GPUs at every layer (slower)\n", __func__, tot / 1048576.0);
+        return;
+    }
+    ggml_backend_synchronize(lctx.backends.front());
+    char * base = (char *) ggml_backend_buffer_get_base(b);
+    std::vector<uint8_t> tmp;
+    size_t off = 0;
+    for (ggml_tensor * t : rem) {
+        llama_context::prefill_main_t::swap_t s = { t, t->data, t->buffer, base + off, b };
+        if (pm.active) { t->data = s.home_data; t->buffer = s.home_buf; }   // always read from the home copy
+        tmp.resize(ggml_nbytes(t));
+        ggml_backend_tensor_get(t, tmp.data(), 0, tmp.size());
+        ggml_tensor alt = *t;
+        alt.data = s.alt_data; alt.buffer = b;
+        ggml_backend_tensor_set(&alt, tmp.data(), 0, tmp.size());
+        if (pm.active) { t->data = s.alt_data; t->buffer = s.alt_buf; }
+        pm.lora_weights.push_back({ ad, s });
+        off += GGML_PAD(ggml_backend_buffer_get_alloc_size(t->buffer, t), dal);
+    }
+    pm.lora_bufs.push_back({ ad, b });
+    LLAMA_LOG_INFO("%s: LoRA, %zu tensors of the remote GPUs copied to the main one for prefill (%.1f MiB)\n",
+                   __func__, rem.size(), tot / 1048576.0);
+#else
+    GGML_UNUSED(lctx); GGML_UNUSED(ad);
+#endif
+}
+
+static void llama_prefill_main_drop_lora(llama_context & lctx, const llama_lora_adapter * ad) {
+    auto & pm = lctx.prefill_main;
+    for (auto it = pm.lora_weights.begin(); it != pm.lora_weights.end();) {
+        if (it->first == ad) {
+            it->second.t->data = it->second.home_data; it->second.t->buffer = it->second.home_buf;
+            it = pm.lora_weights.erase(it);
+        } else ++it;
+    }
+    for (auto it = pm.lora_bufs.begin(); it != pm.lora_bufs.end();) {
+        if (it->first == ad) { ggml_backend_buffer_free(it->second); it = pm.lora_bufs.erase(it); } else ++it;
+    }
+}
+
 int32_t llama_lora_adapter_set(
             struct llama_context * ctx,
             struct llama_lora_adapter * adapter,
             float scale) {
-    if (ctx->cparams.flash_attn) {
-        LLAMA_LOG_ERROR("%s: flash_attn is not compatible with LoRA\n", __func__);
-        return -1;
-    }
+    // The old flash_attn + LoRA ban is not needed here: the correction is added to the product of the
+    // linear (llm_add_lora), attention has nothing to do with it. Removed and verified with and without -fa.
     ctx->lora_adapters[adapter] = scale;
+    llama_prefill_main_add_lora(*ctx, adapter);
     return 0;
 }
 
@@ -8780,6 +9377,10 @@ void llama_lora_adapter_clear(struct llama_context * ctx) {
 }
 
 void llama_lora_adapter_free(struct llama_lora_adapter * adapter) {
+    if (adapter->base_model && adapter->base_model->prefill_main_owner) {
+        // prefill on the main GPU must not keep pointers to the tensors of a freed adapter
+        llama_prefill_main_drop_lora(*(llama_context *) adapter->base_model->prefill_main_owner, adapter);
+    }
     delete adapter;
 }
 
@@ -9987,10 +10588,18 @@ struct llama_context * llama_init_from_model(
                 }
             }
 
+            // prefill on the main GPU: its buffers are allocated now (they enter the memory budget)
+            llama_prefill_main_init(*ctx);
+
             // build worst-case graph
+            // With prefill on the main GPU, batches >= min_tokens never go through the other GPUs: the
+            // decode reservation is made with the largest batch that stays in decode (min_tokens - 1). The other
+            // GPUs (1660: 6 GB) do not hold compute buffers for batches they will never see.
+            const uint32_t n_tokens_dec = ctx->prefill_main.min_tokens > 0 && (int) n_tokens >= ctx->prefill_main.min_tokens
+                                        ? (uint32_t) (ctx->prefill_main.min_tokens - 1) : n_tokens;
             int n_past = cparams.n_ctx - n_tokens;
             llama_token token = llama_token_bos(&ctx->model); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
-            llama_batch reserve_batch = llama_batch_get_one(&token, n_tokens, n_past, 0);
+            llama_batch reserve_batch = llama_batch_get_one(&token, n_tokens_dec, n_past, 0);
             if (llm_arch_is_dsv4(ctx->model.arch) && !llama_prepare_dsv4_graph_inputs(*ctx, reserve_batch, false, true)) {
                 llama_free(ctx);
                 return nullptr;
@@ -10015,6 +10624,22 @@ struct llama_context * llama_init_from_model(
                 }
                 if (!gf_success) {
                     LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+                    llama_free(ctx);
+                    return nullptr;
+                }
+            }
+            // ...and the worst graph is also reserved in that mode (all the layers on the main GPU):
+            // the compute buffers grow to the maximum of the two, before the budget
+            if (ctx->prefill_main.min_tokens > 0 && (int) n_tokens >= ctx->prefill_main.min_tokens) {
+                llama_prefill_main_set(*ctx, true);
+                ggml_backend_sched_reset(ctx->sched);
+                reserve_batch.n_tokens = n_tokens;
+                ggml_cgraph * gfp = llm_build_context::llama_build_graph(*ctx, reserve_batch, true, cparams.worst_graph_tokens);
+                const bool ok = gfp != nullptr && ggml_backend_sched_reserve(ctx->sched, gfp);
+                llama_prefill_main_set(*ctx, false);
+                ggml_backend_sched_reset(ctx->sched);
+                if (!ok) {
+                    LLAMA_LOG_ERROR("%s: failed to allocate compute buffers (prefill on the main GPU)\n", __func__);
                     llama_free(ctx);
                     return nullptr;
                 }
@@ -10736,6 +11361,7 @@ static const char * llama_spec_ckpt_mode_name(int mode) {
 }
 
 int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens) {
+    llama_prefill_main_set(*ctx, false);   // backup copies and restores work on the states at home
     auto & kv = ctx->kv_self;
     const bool is_dsv4 = llm_arch_is_dsv4(ctx->model.arch);
 
@@ -10835,6 +11461,7 @@ int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens) {
 }
 
 bool llama_spec_ckpt_save(struct llama_context * ctx, llama_seq_id seq_id) {
+    llama_prefill_main_set(*ctx, false);   // backup copies and restores work on the states at home
     auto & kv = ctx->kv_self;
 
     switch (kv.ckpt.selected_spec_mode) {
@@ -10880,6 +11507,7 @@ bool llama_rewind_ckpt_save(struct llama_context * ctx, llama_seq_id seq_id, int
 enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
         struct llama_context * ctx, llama_seq_id seq_id,
         llama_pos n_past, int accepted_step) {
+    llama_prefill_main_set(*ctx, false);   // backup copies and restores work on the states at home
     auto & kv = ctx->kv_self;
 
     switch (kv.ckpt.selected_spec_mode) {
@@ -12781,6 +13409,7 @@ struct llama_data_write_file : llama_data_write {
     size_t size_written = 0;
     std::vector<uint8_t> temp_buffer;
     std::vector<uint8_t> aux_buffer;
+    XXH64_state_t * hash = nullptr; // if present, the hash of the bytes written
 
     const llama_model & model;
 
@@ -12788,6 +13417,9 @@ struct llama_data_write_file : llama_data_write {
 
     void write(const void * src, size_t size) override {
         file->write_raw(src, size);
+        if (hash) {
+            XXH64_update(hash, src, size);
+        }
         size_written += size;
     }
 
@@ -12829,11 +13461,15 @@ struct llama_data_read_file : llama_data_read {
     llama_file * file;
     size_t size_read = 0;
     std::vector<uint8_t> temp_buffer;
+    XXH64_state_t * hash = nullptr; // if present, the hash of the bytes read
 
     llama_data_read_file(llama_file * f) : file(f) {}
 
     void read_to(void * dst, size_t size) override {
         file->read_raw(dst, size);
+        if (hash) {
+            XXH64_update(hash, dst, size);
+        }
         size_read += size;
     }
 
@@ -12928,6 +13564,7 @@ size_t llama_state_get_size(struct llama_context * ctx) {
 }
 
 static size_t llama_state_set_data_internal(struct llama_context * ctx, llama_data_read & data_ctx) {
+    llama_prefill_main_set(*ctx, false);   // the state is written at home (the prefill copy realigns itself)
     if (!llama_state_io_supported(ctx, __func__)) {
         return SIZE_MAX;
     }
@@ -13076,6 +13713,7 @@ size_t llama_state_seq_get_data(struct llama_context * ctx, uint8_t * dst, size_
 }
 
 static size_t llama_state_seq_set_data_internal(struct llama_context * ctx, llama_data_read & data_ctx, llama_seq_id dest_seq_id, llama_state_seq_flags flags) {
+    llama_prefill_main_set(*ctx, false);   // the state is written at home (the prefill copy realigns itself)
     if (!llama_state_io_supported(ctx, __func__, flags, dest_seq_id)) {
         return SIZE_MAX;
     }
@@ -13096,7 +13734,7 @@ size_t llama_state_seq_set_data(struct llama_context * ctx, const uint8_t * src,
     }
 }
 
-static size_t llama_state_seq_save_file_internal(struct llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
+static size_t llama_state_seq_save_file_internal(struct llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count, uint64_t * hash_out) {
     if (!llama_state_io_supported(ctx, __func__, 0, seq_id)) {
         return 0;
     }
@@ -13109,10 +13747,18 @@ static size_t llama_state_seq_save_file_internal(struct llama_context * ctx, con
     file.write_u32((uint32_t) n_token_count);
     file.write_raw(tokens, sizeof(llama_token) * n_token_count);
 
+    XXH64_state_t hash;
+    XXH64_reset(&hash, 0);
+    XXH64_update(&hash, tokens, sizeof(llama_token) * n_token_count);
+
     // save the context state using stream saving
     llama_data_write_file data_ctx(&file, ctx->model);
+    data_ctx.hash = hash_out ? &hash : nullptr;
     if (llama_state_seq_get_data_internal(ctx, data_ctx, seq_id, 0) == 0) {
         return 0;
+    }
+    if (hash_out) {
+        *hash_out = XXH64_digest(&hash);
     }
 
     const size_t res = file.tell();
@@ -13120,7 +13766,7 @@ static size_t llama_state_seq_save_file_internal(struct llama_context * ctx, con
     return res;
 }
 
-static size_t llama_state_seq_load_file_internal(struct llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+static size_t llama_state_seq_load_file_internal(struct llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out, uint64_t * hash_out) {
     if (!llama_state_io_supported(ctx, __func__, 0, dest_seq_id)) {
         return 0;
     }
@@ -13150,10 +13796,15 @@ static size_t llama_state_seq_load_file_internal(struct llama_context * ctx, con
         *n_token_count_out = n_token_count;
     }
 
+    XXH64_state_t hash;
+    XXH64_reset(&hash, 0);
+    XXH64_update(&hash, tokens_out, sizeof(llama_token) * *n_token_count_out);
+
     // restore the context state
     {
         const size_t state_size = file.size() - file.tell();
         llama_data_read_file data_ctx(&file);
+        data_ctx.hash = hash_out ? &hash : nullptr;
         const size_t nread = llama_state_seq_set_data_internal(ctx, data_ctx, dest_seq_id, 0);
         if (!nread) {
             LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
@@ -13162,13 +13813,20 @@ static size_t llama_state_seq_load_file_internal(struct llama_context * ctx, con
         GGML_ASSERT(nread <= state_size);
         GGML_ASSERT(nread + sizeof(uint32_t) * 3 + sizeof(llama_token) * *n_token_count_out == file.tell());
     }
+    if (hash_out) {
+        *hash_out = XXH64_digest(&hash);
+    }
 
     return file.tell();
 }
 
 size_t llama_state_seq_save_file(struct llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
+    return llama_state_seq_save_file_hashed(ctx, filepath, seq_id, tokens, n_token_count, nullptr);
+}
+
+size_t llama_state_seq_save_file_hashed(struct llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count, uint64_t * hash_out) {
     try {
-        return llama_state_seq_save_file_internal(ctx, filepath, seq_id, tokens, n_token_count);
+        return llama_state_seq_save_file_internal(ctx, filepath, seq_id, tokens, n_token_count, hash_out);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving sequence state file: %s\n", __func__, err.what());
         return 0;
@@ -13176,8 +13834,12 @@ size_t llama_state_seq_save_file(struct llama_context * ctx, const char * filepa
 }
 
 size_t llama_state_seq_load_file(struct llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    return llama_state_seq_load_file_hashed(ctx, filepath, dest_seq_id, tokens_out, n_token_capacity, n_token_count_out, nullptr);
+}
+
+size_t llama_state_seq_load_file_hashed(struct llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out, uint64_t * hash_out) {
     try {
-        return llama_state_seq_load_file_internal(ctx, filepath, dest_seq_id, tokens_out, n_token_capacity, n_token_count_out);
+        return llama_state_seq_load_file_internal(ctx, filepath, dest_seq_id, tokens_out, n_token_capacity, n_token_count_out, hash_out);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading sequence state file: %s\n", __func__, err.what());
         return 0;

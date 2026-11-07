@@ -1684,6 +1684,58 @@ static void dequantize_block_q8_0_f16_cuda(const void * __restrict__ vx, half * 
     }
 }
 
+
+// ---------------------------------------------------------------- TRL (ggml-trl.h)
+#include "../ggml-trl.h"
+#include "../ggml-trl-cb.h"
+
+__device__ const float trl_gauss_cb_dev[TRL_GAUSS_CB_N] = { TRL_GAUSS_CB_VALUES };
+
+// One CUDA block = one tile (64 rows x 4 columns), one thread = one weight of the chain.
+template<typename dst_t, int b, bool mul1>
+static __global__ void dequantize_block_trl(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t K) {
+    const int64_t ntile = K / TRL_G;
+    const int64_t band = blockIdx.x / ntile;
+    const int64_t j    = blockIdx.x - band * ntile;
+    const uint8_t * bp = (const uint8_t *) vx + band * trl_band_bytes(K, b);
+    __shared__ uint32_t tw[8 * b];
+    if (threadIdx.x < 8 * b) {
+        tw[threadIdx.x] = ((const uint32_t *)(bp + 4 * TRL_TX))[j * 8 * b + threadIdx.x];
+    }
+    __syncthreads();
+    const int t = threadIdx.x;
+    const uint32_t st = trl_state(tw, t, b);
+    const float v = mul1 ? trl_mul1_value(st) : trl_gauss_cb_dev[st];
+    const float w = ((const float *) bp)[t >> 2] * v;
+    dst_t * y = yy + (band * TRL_TX + (t >> 2)) * K + TRL_G * j + (t & 3);
+    if constexpr (std::is_same_v<dst_t, nv_bfloat16>) {
+        *y = __float2bfloat16(w);
+    } else {
+        *y = (dst_t) w;
+    }
+}
+
+template<typename dst_t, int b, bool mul1>
+static void dequantize_row_trl_cuda(const void * vx, dst_t * y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
+    GGML_ASSERT(nrows % TRL_TX == 0);
+    GGML_ASSERT(n_per_row % 256 == 0);
+    const int64_t nblocks = (nrows / TRL_TX) * (n_per_row / TRL_G);
+    static const bool prof = getenv("TRL_PROF") != nullptr;
+    cudaEvent_t e0 = nullptr, e1 = nullptr;
+    if (prof) {
+        cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventRecord(e0, stream);
+    }
+    dequantize_block_trl<dst_t, b, mul1><<<nblocks, TRL_TILE, 0, stream>>>(vx, y, n_per_row);
+    if (prof) {
+        cudaEventRecord(e1, stream); cudaEventSynchronize(e1);
+        float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
+        cudaEventDestroy(e0); cudaEventDestroy(e1);
+        static double tot = 0; static long n = 0;
+        if (n == 0) atexit([]() { fprintf(stderr, "TRL_PROF dequant %.1f ms in %ld calls\n", tot, n); });
+        tot += ms; ++n;
+    }
+}
+
 // IQ3KS_R16: 16-row interleaved IQ3_KS-class codebook. Band = 16 f32 row
 // scales + n/32 blocks of 204 B (block = 16 rows x 32 columns = 512 quants).
 template<typename dst_t>
@@ -2150,6 +2202,14 @@ static void convert_to_bf16_cuda(const void * __restrict__ vx, nv_bfloat16 * __r
 
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_TRL2_G:
+            return dequantize_row_trl_cuda<nv_bfloat16, 2, false>;
+        case GGML_TYPE_TRL2_M:
+            return dequantize_row_trl_cuda<nv_bfloat16, 2, true>;
+        case GGML_TYPE_TRL3_G:
+            return dequantize_row_trl_cuda<nv_bfloat16, 3, false>;
+        case GGML_TYPE_TRL3_M:
+            return dequantize_row_trl_cuda<nv_bfloat16, 3, true>;
         case GGML_TYPE_F32:
             return convert_to_bf16_cuda<float>;
         case GGML_TYPE_F16:
@@ -2203,6 +2263,14 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
 
 to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_TRL2_G:
+            return dequantize_row_trl_cuda<half, 2, false>;
+        case GGML_TYPE_TRL2_M:
+            return dequantize_row_trl_cuda<half, 2, true>;
+        case GGML_TYPE_TRL3_G:
+            return dequantize_row_trl_cuda<half, 3, false>;
+        case GGML_TYPE_TRL3_M:
+            return dequantize_row_trl_cuda<half, 3, true>;
         case GGML_TYPE_Q2_0:
             return dequantize_row_q2_0_cuda;
         case GGML_TYPE_Q4_0:
@@ -2317,6 +2385,14 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
 
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_TRL2_G:
+            return dequantize_row_trl_cuda<float, 2, false>;
+        case GGML_TYPE_TRL2_M:
+            return dequantize_row_trl_cuda<float, 2, true>;
+        case GGML_TYPE_TRL3_G:
+            return dequantize_row_trl_cuda<float, 3, false>;
+        case GGML_TYPE_TRL3_M:
+            return dequantize_row_trl_cuda<float, 3, true>;
         case GGML_TYPE_Q2_0:
             return dequantize_row_q2_0_cuda;
         case GGML_TYPE_Q4_0:

@@ -44,6 +44,16 @@ private:
     std::vector<llama_seq_id> token_seq_ids;
     bool all_same_seq;
     bool has_unique_seq_ids;
+    // one token for each of several sequences (a decode step of several slots): the layer runs once
+    // for the whole batch, with the recurrent states gathered from and scattered back to their slots
+    bool use_multi = false;
+
+    static bool multi_states_supported(llama_context & lctx, int64_t head_k_dim, int64_t num_k_heads,
+            int64_t head_v_dim, int64_t num_v_heads);
+
+    ggml_tensor * build_layer_attn_linear_multi(ggml_context * ctx0, ggml_cgraph * gf,
+            ggml_tensor * cur, ggml_tensor * inp_out_ids, int il, const llm_build_cb & cb,
+            bool external_residual, ggml_unary_op gate_op) const;
 
     static std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(llama_context & lctx, ggml_context * ctx0,
             ggml_tensor * wqkv, ggml_tensor * wqkv_gate, ggml_tensor * input, int il, const llm_build_cb & cb,

@@ -1,0 +1,98 @@
+#version 450
+
+// Product with the computed-codebook TRL weights (TRL2_M, TRL3_M; format in ggml-trl.h), input already rotated
+// by trl_prep. One group = one band of 64 rows for NCOLS columns: 64 rows x 4 slices of K, then the slices are summed.
+// Weight W[n,k] = s_n * cb(state), state = 14-bit window ending at bit (t+1)*B of the tile's stream
+// (big-endian in uint32 words), t = 4*row + column in the tile; cb = (bytesum(state*0x83DCD12D) - 510) / 147.80.
+
+#extension GL_EXT_control_flow_attributes : enable
+
+#define NROWS 64
+#define KSPLIT 4
+#define NCOLS 8
+#define TRL_L 14u
+#define TRL_MASK 16383u
+
+layout(local_size_x = NROWS * KSPLIT, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {uint data_a[];};
+layout (binding = 1) readonly buffer B {float data_b[];};
+layout (binding = 2) writeonly buffer D {float data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint K;
+    uint ncols;
+    uint a_offset;   // uint32 words
+    uint d_offset;   // float
+    uint d_stride;   // floats between two output columns
+} p;
+
+shared float red[KSPLIT - 1][NROWS][NCOLS];
+
+uint trl_state(uint tw, uint t) {
+    const uint end = (t + 1) * TRL_B;
+    if (end < TRL_L) {
+        return (data_a[tw] >> (32 - end)) & ((1u << end) - 1u);
+    }
+    const uint start = end - TRL_L;
+    const uint i0 = start >> 5, off = start & 31;
+    const uint hi = data_a[tw + i0];
+    if (off + TRL_L <= 32) {
+        return (hi >> (32 - off - TRL_L)) & TRL_MASK;
+    }
+    const uint lo = data_a[tw + i0 + 1];   // the window spills into the next word, which exists: end <= 256*B
+    return ((hi << (off + TRL_L - 32)) | (lo >> (64 - off - TRL_L))) & TRL_MASK;
+}
+
+float trl_value(uint state) {
+    const uint x = state * 0x83DCD12Du;
+    const int s = int(x & 0xffu) + int((x >> 8) & 0xffu) + int((x >> 16) & 0xffu) + int(x >> 24);
+    return float(s - 510) / 147.80054127099805;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint r = tid % NROWS, ks = tid / NROWS;
+    const uint band = gl_WorkGroupID.x;
+    const uint col0 = gl_WorkGroupID.y * NCOLS;
+    const uint nc = min(NCOLS, p.ncols - col0);
+
+    const uint tile_words = 8 * TRL_B;
+    const uint band_words = NROWS + (p.K / 4) * tile_words;
+    const uint base = p.a_offset + band * band_words;
+
+    float acc[NCOLS];
+    [[unroll]] for (uint c = 0; c < NCOLS; ++c) {
+        acc[c] = 0.0;
+    }
+
+    for (uint j = ks; j < p.K / 4; j += KSPLIT) {
+        const uint tw = base + NROWS + j * tile_words;
+        [[unroll]] for (uint q = 0; q < 4; ++q) {
+            const float w = trl_value(trl_state(tw, 4 * r + q));
+            const uint k = 4 * j + q;
+            [[unroll]] for (uint c = 0; c < NCOLS; ++c) {
+                if (c < nc) {
+                    acc[c] += w * data_b[(col0 + c) * p.K + k];
+                }
+            }
+        }
+    }
+
+    if (ks > 0) {
+        [[unroll]] for (uint c = 0; c < NCOLS; ++c) {
+            red[ks - 1][r][c] = acc[c];
+        }
+    }
+    barrier();
+    if (ks == 0) {
+        const float s = uintBitsToFloat(data_a[base + r]);
+        for (uint c = 0; c < nc; ++c) {
+            float v = acc[c];
+            [[unroll]] for (uint i = 0; i < KSPLIT - 1; ++i) {
+                v += red[i][r][c];
+            }
+            data_d[p.d_offset + (col0 + c) * p.d_stride + band * NROWS + r] = s * v;
+        }
+    }
+}

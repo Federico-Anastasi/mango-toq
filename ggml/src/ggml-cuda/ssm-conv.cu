@@ -574,13 +574,15 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
         // Fast path for multi-sequence decode-like batches:
         // one token per unique sequence, no copy-to-multiple-sequences routing.
+        // the pool frees in reverse order of allocation: the flag outlives this block, so it goes first
+        fast_path_ok_d.alloc(1);
         ggml_cuda_pool_alloc<int32_t> seq_ids(ctx.pool(), n_t);
         ggml_cuda_pool_alloc<int32_t> seq_seen(ctx.pool(), n_kv);
-        int32_t fast_path_ok = 1;
-        fast_path_ok_d.alloc(1);
 
         CUDA_CHECK(cudaMemsetAsync(seq_seen.get(), 0, n_kv * sizeof(int32_t), ctx.stream()));
-        CUDA_CHECK(cudaMemcpyAsync(fast_path_ok_d.get(), &fast_path_ok, sizeof(int32_t), cudaMemcpyHostToDevice, ctx.stream()));
+        // any non-zero value means "fast path ok" (the kernels only test == 0). A memset, not a copy from
+        // a host stack variable: inside a captured CUDA graph the copy would be replayed from that address.
+        CUDA_CHECK(cudaMemsetAsync(fast_path_ok_d.get(), 1, sizeof(int32_t), ctx.stream()));
 
         constexpr int seq_map_block_size = 256;
         const dim3 seq_map_grid((n_t + seq_map_block_size - 1) / seq_map_block_size, 1, 1);

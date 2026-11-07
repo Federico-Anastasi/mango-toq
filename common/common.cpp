@@ -3132,6 +3132,21 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.cache_ram_mib = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "--cache-disk") {
+        CHECK_ARG
+        params.cache_disk = argv[i];
+        return true;
+    }
+    if (arg == "--cache-disk-mib") {
+        CHECK_ARG
+        params.cache_disk_mib = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--cache-disk-hours") {
+        CHECK_ARG
+        params.cache_disk_hours = std::stoi(argv[i]);
+        return true;
+    }
     if (arg == "-crs" || arg == "--cache-ram-similarity") {
         CHECK_ARG
         params.cache_ram_similarity = std::stof(argv[i]);
@@ -3342,6 +3357,9 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-ctx-ckpt-t N, --ctx-checkpoints-tolerance N", "the number of tokens before the full prompt to create the checkpoint.  (default: %d, <=0 disable)",params.ctx_checkpoints_tolerance});
     options.push_back({ "*",           "-ctx-ckpt-e NAME, --ctx-checkpoints-eviction NAME", "Eviction strategy for checkpoint. Accepts fifo, variance and auto. Auto defaults to variance. Variance preserves coverage and maintains uniform interval.  (default: variance)" });
     options.push_back({ "*",           "-cram, --cache-ram N",          "set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)",params.cache_ram_mib });
+    options.push_back({ "*",           "       --cache-disk DIR",       "keep slot states on disk in DIR across restarts and conversation switches (replaces --cache-ram)" });
+    options.push_back({ "*",           "       --cache-disk-mib N",     "disk space cap for --cache-disk in MiB, least recently used out first (default: %d)", params.cache_disk_mib });
+    options.push_back({ "*",           "       --cache-disk-hours N",   "drop --cache-disk states unused for N hours (default: %d)", params.cache_disk_hours });
     options.push_back({ "*",           "-crs,  --cache-ram-similarity N",           "minimum fraction of a cached entry that must match the new prompt for that entry to be reusable (default: %.2f).",params.cache_ram_similarity });
     options.push_back({ "*",           "-cram-n-min N, --cache-ram-n-min N",           "minimum number of the cached tokens that triggers prompt cache (default: %d).", params.cache_ram_n_min });
     options.push_back({ "*",           "-n,    --predict N",            "number of tokens to predict (default: %d, -1 = infinity, -2 = until context filled)", params.n_predict });

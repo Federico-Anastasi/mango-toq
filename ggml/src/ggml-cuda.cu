@@ -19,6 +19,7 @@
 #include "ggml-cuda/clamp.cuh"
 #include "ggml-cuda/concat.cuh"
 #include "ggml-cuda/convert.cuh"
+#include "ggml-cuda/trl.cuh"
 #include "ggml-cuda/cpy.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/diagmask.cuh"
@@ -77,6 +78,8 @@
 #include <memory>
 #include <mutex>
 #include <condition_variable>
+#include <chrono>
+#include <thread>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -561,6 +564,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
+    }
+    if (copy_dst_event != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(copy_dst_event));
     }
     if (compute_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(compute_event));
@@ -1777,6 +1783,8 @@ static cudaError_t ggml_cuda_cpy_tensor_2d(
     }
 }
 
+
+
 static void ggml_cuda_op_mul_mat_cublas(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
@@ -2722,8 +2730,76 @@ static __global__ void k_simple_gemm_f32(int n, int nx, const float * x, const f
     }
 }
 
+// Matrix-vector product with bf16 weights and f32 activations, up to 4 columns: the small
+// DeltaNet linears (alpha/beta, 48 rows) used to go through cuBLAS bf16 (activations and output rounded to bf16, three
+// launches; emulated on Turing: ~67 us each, ~6 ms per token on the 1660). Here bf16 -> f32 is exact (16-bit shift),
+// f32 accumulation: more precise than the previous path. One block of 128 threads per row.
+template <int NC>
+static __global__ void __launch_bounds__(128) k_bf16_gemv(const uint16_t * __restrict__ w, const float * __restrict__ x,
+                                                          float * __restrict__ y, int K, int64_t ldw, int64_t ldx, int64_t ldy) {
+    const int row = blockIdx.x, tid = threadIdx.x;
+    const uint16_t * wr = w + (int64_t) row * ldw;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.f;
+    for (int k = 2 * tid; k < K; k += 2 * 128) {
+        const uint32_t p = *reinterpret_cast<const uint32_t *>(wr + k);
+        const float w0 = __uint_as_float(p << 16), w1 = __uint_as_float(p & 0xffff0000u);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const float2 xv = *reinterpret_cast<const float2 *>(x + c * ldx + k);
+            acc[c] = fmaf(w0, xv.x, fmaf(w1, xv.y, acc[c]));
+        }
+    }
+    __shared__ float red[NC][4];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        float s = warp_reduce_sum(acc[c]);
+        if ((tid & 31) == 0) red[c][tid >> 5] = s;
+    }
+    __syncthreads();
+    if (tid < NC) y[tid * ldy + row] = red[tid][0] + red[tid][1] + red[tid][2] + red[tid][3];
+}
+
+static bool ggml_cuda_bf16_gemv(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (src0->type != GGML_TYPE_BF16 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+    const int64_t K = src0->ne[0], N = src0->ne[1], nc = src1->ne[1];
+    if (nc < 1 || nc > 4 || K % 2 != 0 || src0->ne[2] * src0->ne[3] != 1 || src1->ne[2] * src1->ne[3] != 1) return false;
+    if (src0->nb[0] != 2 || src1->nb[0] != 4 || src0->nb[1] % 4 != 0 || src1->nb[1] % 8 != 0 || !ggml_is_contiguous(dst)) return false;
+    if (((uintptr_t) src0->data & 3) || ((uintptr_t) src1->data & 7)) return false;
+    static const bool off = getenv("GGML_CUDA_BF16_GEMV") != nullptr && atoi(getenv("GGML_CUDA_BF16_GEMV")) == 0;
+    if (off) return false;
+    const uint16_t * w = (const uint16_t *) src0->data;
+    const float * x = (const float *) src1->data;
+    float * y = (float *) dst->data;
+    const int64_t ldw = src0->nb[1] / 2, ldx = src1->nb[1] / 4, ldy = dst->nb[1] / 4;
+    cudaStream_t st = ctx.stream();
+    switch (nc) {
+        case 1: k_bf16_gemv<1><<<N, 128, 0, st>>>(w, x, y, K, ldw, ldx, ldy); break;
+        case 2: k_bf16_gemv<2><<<N, 128, 0, st>>>(w, x, y, K, ldw, ldx, ldy); break;
+        case 3: k_bf16_gemv<3><<<N, 128, 0, st>>>(w, x, y, K, ldw, ldx, ldy); break;
+        default: k_bf16_gemv<4><<<N, 128, 0, st>>>(w, x, y, K, ldw, ldx, ldy); break;
+    }
+    return true;
+}
+
 static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const ggml_cgraph * cgraph, int node_n) {
+
+    if (src1->ne[1] <= 4 && dst->src[2] == nullptr && ggml_cuda_bf16_gemv(ctx, src0, src1, dst)) {
+        return node_n;
+    }
+    // TRL: trellis weights with the computed codebook, up to 8 columns (one token at a time)
+    if (ggml_cuda_trl_mmv_supported(src0, src1, dst)) {
+        ggml_cuda_trl_mul_mat_vec(ctx, src0, src1, dst);
+        return node_n;
+    }
+    if (ggml_cuda_trl_mm_supported(src0, src1, dst)) {
+        ggml_cuda_trl_mul_mat_gemm(ctx, src0, src1, dst);
+        return node_n;
+    }
+    // only the two paths above can do the TRL input rotation (src[2]): anywhere else it would vanish
+    GGML_ASSERT(dst->src[2] == nullptr || src0->type < GGML_TYPE_TRL2_G || src0->type > GGML_TYPE_TRL3_M);
 
     if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
         src0->ne[0] >= 1024 && src0->ne[2]*src0->ne[3] == 1 && src1->ne[2]*src1->ne[3] == 1 && src1->ne[1] <= 8) {
@@ -4426,6 +4502,7 @@ GGML_CALL static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend,
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *)tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
@@ -4496,7 +4573,15 @@ GGML_CALL static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_
                 needs_f16_f32_copy = true;
 
             } else {
+                // the copy runs on the source stream: first wait for the work already queued on the destination,
+                // which may still read that memory (the scheduler no longer stops the CPU between the parts)
+                ggml_cuda_set_device(cuda_ctx_dst->device);
+                if (!cuda_ctx_dst->copy_dst_event) {
+                    CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_dst->copy_dst_event, cudaEventDisableTiming));
+                }
+                CUDA_CHECK(cudaEventRecord(cuda_ctx_dst->copy_dst_event, cuda_ctx_dst->stream()));
                 ggml_cuda_set_device(cuda_ctx_src->device);
+                CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_src->stream(), cuda_ctx_dst->copy_dst_event, 0));
                 CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, cuda_ctx_dst->device, src->data, cuda_ctx_src->device, ggml_nbytes(dst), cuda_ctx_src->stream()));
             }
 #endif
@@ -4569,6 +4654,10 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
 
         if (node->op == GGML_OP_REDUCE) {
             use_cuda_graph = false;
+            break;
+        }
+        if (node->op == GGML_OP_MUL_MAT && node->src[1] && node->src[1]->ne[1] > 8) {
+            use_cuda_graph = false;   // large batch (prompt read): negligible launch cost, expensive capture
             break;
         }
 
@@ -4748,7 +4837,44 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
 
                 if (ggml_is_noop(node)) continue;
 
+                // TRL_PROF=1: GPU time per (operation, type of the first input), printed at exit.
+                // Diagnostics: synchronizes at every node, so only without CUDA graphs (GGML_CUDA_DISABLE_GRAPHS=1).
+                static const bool trl_prof = getenv("TRL_PROF") != nullptr;
+                cudaEvent_t trl_e0 = nullptr, trl_e1 = nullptr;
+                std::string trl_key;
+                if (trl_prof && !use_cuda_graph) {
+                    trl_key = "d" + std::to_string(cuda_ctx->device) + " " + std::string(ggml_op_name(node->op)) + " " +
+                              (node->src[0] ? ggml_type_name(node->src[0]->type) : "-") +
+                              (node->op == GGML_OP_MUL_MAT ? (node->src[1]->ne[1] <= 8 ? " vec" : " mat") : "");
+                    CUDA_CHECK(cudaEventCreate(&trl_e0));
+                    CUDA_CHECK(cudaEventCreate(&trl_e1));
+                    CUDA_CHECK(cudaEventRecord(trl_e0, cuda_ctx->stream()));
+                }
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node, cgraph, i);
+                if (trl_e0) {
+                    CUDA_CHECK(cudaEventRecord(trl_e1, cuda_ctx->stream()));
+                    CUDA_CHECK(cudaEventSynchronize(trl_e1));
+                    float ms = 0;
+                    CUDA_CHECK(cudaEventElapsedTime(&ms, trl_e0, trl_e1));
+                    cudaEventDestroy(trl_e0);
+                    cudaEventDestroy(trl_e1);
+                    static std::map<std::string, std::pair<double, long>> * trl_acc = nullptr;
+                    if (!trl_acc) {
+                        trl_acc = new std::map<std::string, std::pair<double, long>>();
+                        atexit([]() {
+                            std::vector<std::pair<double, std::string>> v;
+                            double tot = 0;
+                            for (auto & kv : *trl_acc) { v.push_back({kv.second.first, kv.first}); tot += kv.second.first; }
+                            std::sort(v.rbegin(), v.rend());
+                            fprintf(stderr, "TRL_PROF total %.1f ms\n", tot);
+                            for (auto & x : v) fprintf(stderr, "TRL_PROF %10.1f ms %6.1f%%  %s (%ld)\n", x.first, 100*x.first/tot,
+                                                       x.second.c_str(), (*trl_acc)[x.second].second);
+                        });
+                    }
+                    auto & acc = (*trl_acc)[trl_key];
+                    acc.first += ms;
+                    acc.second += 1;
+                }
                 if (!ok) {
                     GGML_CUDA_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -4789,8 +4915,63 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
     }
 }
 
+// Clock keeper (ported from the prism engine): with the model split across GPUs each one sits idle for
+// most of the token and the driver drops it to P3 (measured: 3060 Ti at 720 MHz instead of 2100,
+// decode -40%). Without admin the clocks cannot be locked: a single warp spins on a lowest-priority
+// stream, only while the engine works (last graph < 0.5 s ago). No memory bandwidth, a fraction of one SM.
+// Enable with GGML_CUDA_CLOCK_KEEPER=1 (or =N: duration of each kernel in microseconds).
+static std::atomic<int64_t> trl_last_compute_us{0};
+
+static __global__ void trl_clock_keeper_kernel(long long cycles) {
+    const long long t0 = clock64();
+    while (clock64() - t0 < cycles) { }
+}
+
+static void trl_clock_keeper_start(int device) {
+    static const char * env = getenv("GGML_CUDA_CLOCK_KEEPER");
+    if (env == nullptr || atoi(env) == 0) {
+        return;
+    }
+    static std::mutex mtx;
+    static bool started[GGML_CUDA_MAX_DEVICES] = {};
+    std::lock_guard<std::mutex> lock(mtx);
+    if (started[device]) {
+        return;
+    }
+    started[device] = true;
+    const int us = atoi(env) > 1 ? atoi(env) : 200;
+    std::thread([device, us]() {
+        if (cudaSetDevice(device) != cudaSuccess) {
+            return;
+        }
+        int prio_lo = 0, prio_hi = 0;
+        cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi);
+        cudaStream_t s;
+        if (cudaStreamCreateWithPriority(&s, cudaStreamNonBlocking, prio_lo) != cudaSuccess) {
+            return;
+        }
+        int khz = 0;
+        cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, device);
+        const long long cycles = (long long) khz * us / 1000;
+        fprintf(stderr, "%s: clock keeper active on device %d (%d us per kernel)\n", __func__, device, us);
+        while (true) {
+            if (ggml_time_us() - trl_last_compute_us.load(std::memory_order_relaxed) > 500000) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+            for (int i = 0; i < 4; ++i) {
+                trl_clock_keeper_kernel<<<1, 32, 0, s>>>(cycles);
+            }
+            if (cudaStreamSynchronize(s) != cudaSuccess) {
+                return;
+            }
+        }
+    }).detach();
+}
+
 GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+    trl_last_compute_us.store(ggml_time_us(), std::memory_order_relaxed);
 
     ggml_cuda_set_device(cuda_ctx->device);
 
@@ -4813,8 +4994,11 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
 
     bool cuda_graph_update_required = false;
 
+    // GGML_CUDA_GRAPHS_PRE_AMPERE=1: CUDA graphs on Pascal/Turing too (decode on 1660/1080 launches
+    // ~1300 kernels per token from the CPU)
+    static const bool graphs_pre_ampere = getenv("GGML_CUDA_GRAPHS_PRE_AMPERE") != nullptr;
     if (use_cuda_graph && graph->graph == nullptr) {
-        if (ggml_cuda_info().devices[cuda_ctx->device].cc < CC_AMPERE) {
+        if (ggml_cuda_info().devices[cuda_ctx->device].cc < CC_AMPERE && !graphs_pre_ampere) {
             graph->disable_due_to_gpu_arch = true;
 #ifndef NDEBUG
             GGML_CUDA_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
@@ -5010,6 +5194,10 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                     case GGML_TYPE_IQ1_M_R4:
                     case GGML_TYPE_IQ3_KS_R16:
                     case GGML_TYPE_IQ4_KS_R16:
+                    case GGML_TYPE_TRL2_G:
+                    case GGML_TYPE_TRL3_G:
+                    case GGML_TYPE_TRL2_M:
+                    case GGML_TYPE_TRL3_M:
                         return true;
                     default:
                         return false;
@@ -5505,6 +5693,8 @@ GGML_CALL ggml_backend_t ggml_backend_cuda_init(int device, [[maybe_unused]] con
         GGML_CUDA_LOG_ERROR("%s: invalid device %d\n", __func__, device);
         return nullptr;
     }
+
+    trl_clock_keeper_start(device);
 
     ggml_backend_cuda_context * ctx = new ggml_backend_cuda_context(device, model);
     if (ctx == nullptr) {

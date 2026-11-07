@@ -72,8 +72,9 @@ static inline float32x4_t v_gelu(float32x4_t x, float32x4_t c1, float32x4_t c2) 
     const float32x4_t one = vdupq_n_f32(1.0f);
     float32x4_t arg = vfmaq_f32(one, c1, vmulq_f32(x, x));
     arg = vmulq_f32(arg, vmulq_f32(x, c2));
-    float32x4_t exp_arg = v_expf(arg);
-    float32x4_t gelu = vmulq_f32(x, vdivq_f32(exp_arg, vaddq_f32(exp_arg, one)));
+    // x / (1 + exp(-arg)), not x * exp(arg) / (exp(arg) + 1): with -ffp-model=fast the product x * exp(arg) gets reassociated and goes to inf for x just below 10
+    float32x4_t exp_neg = v_expf(vnegq_f32(arg));
+    float32x4_t gelu = vdivq_f32(x, vaddq_f32(one, exp_neg));
     uint32x4_t mask = vcgtq_f32(x, vdupq_n_f32(10.f));
     return vbslq_f32(mask, x, gelu);
 }
@@ -217,8 +218,9 @@ static inline __m256 v_gelu(__m256 x, __m256 c1, __m256 c2) {
     const __m256 mask = _mm256_cmp_ps(x, _mm256_set1_ps(10.f), _CMP_GT_OQ);
     __m256 arg = _mm256_add_ps(one, _mm256_mul_ps(_mm256_mul_ps(x, x), c1));
     arg = _mm256_mul_ps(arg, _mm256_mul_ps(x, c2));
-    __m256 exp_arg = v_expf(arg);
-    __m256 gelu = _mm256_mul_ps(x, _mm256_div_ps(exp_arg, _mm256_add_ps(exp_arg, one)));
+    // x / (1 + exp(-arg)), not x * exp(arg) / (exp(arg) + 1): with -ffp-model=fast the product x * exp(arg) gets reassociated and goes to inf for x just below 10
+    __m256 exp_neg = v_expf(_mm256_sub_ps(_mm256_setzero_ps(), arg));
+    __m256 gelu = _mm256_div_ps(x, _mm256_add_ps(one, exp_neg));
     return _mm256_or_ps(_mm256_and_ps(mask, x), _mm256_andnot_ps(mask, gelu));
 }
 static inline __m256 v_silu(__m256 x) {

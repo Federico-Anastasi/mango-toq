@@ -1770,6 +1770,58 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
         .row_meta_size            = 0,
     },
+    [GGML_TYPE_TRL2_G] = {
+        .type_name                = "trl2_g",
+        .blck_size                = 4,
+        .type_size                = 1,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_trl2_g,
+        .from_float               = NULL,
+        .from_float_ref           = NULL,
+        .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+        .row_meta_size            = 4,
+    },
+    [GGML_TYPE_TRL3_G] = {
+        .type_name                = "trl3_g",
+        .blck_size                = 8,
+        .type_size                = 3,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_trl3_g,
+        .from_float               = NULL,
+        .from_float_ref           = NULL,
+        .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+        .row_meta_size            = 4,
+    },
+    [GGML_TYPE_TRL2_M] = {
+        .type_name                = "trl2_m",
+        .blck_size                = 4,
+        .type_size                = 1,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_trl2_m,
+        .from_float               = NULL,
+        .from_float_ref           = NULL,
+        .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+        .row_meta_size            = 4,
+    },
+    [GGML_TYPE_TRL3_M] = {
+        .type_name                = "trl3_m",
+        .blck_size                = 8,
+        .type_size                = 3,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_trl3_m,
+        .from_float               = NULL,
+        .from_float_ref           = NULL,
+        .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+        .row_meta_size            = 4,
+    },
     [GGML_TYPE_PTQ1_0_R8] = {
         .type_name                = "ptq1_0_r8",
         .blck_size                = QK_PTQ1_0,
@@ -2184,7 +2236,9 @@ ggml_type_traits_t ggml_internal_get_type_traits(enum ggml_type type) {
 }
 
 static inline int ggml_packed_rows(enum ggml_type type) {
-    return type == GGML_TYPE_BF16_R16 || type == GGML_TYPE_Q8_K_R16 || type == GGML_TYPE_IQ3_KS_R16 ? 16
+    return type == GGML_TYPE_TRL2_G || type == GGML_TYPE_TRL3_G ||
+           type == GGML_TYPE_TRL2_M || type == GGML_TYPE_TRL3_M ? 64    // bands of 64 rows (ggml-trl.h)
+         : type == GGML_TYPE_BF16_R16 || type == GGML_TYPE_Q8_K_R16 || type == GGML_TYPE_IQ3_KS_R16 ? 16
          : type == GGML_TYPE_Q8_K_R8 || type == GGML_TYPE_Q8_KV_R8 ||
            type == GGML_TYPE_Q8_0_R8 || type == GGML_TYPE_Q4_0_R8 ||
            type == GGML_TYPE_IQ4_XS_R8 ? 8
@@ -3694,8 +3748,9 @@ inline static float32x4_t ggml_v_gelu(float32x4_t x, float32x4_t c1, float32x4_t
     //float32x4_t arg = vaddq_f32(one, vmulq_f32(vmulq_f32(x, x), c1));
     float32x4_t arg = vfmaq_f32(one, c1, vmulq_f32(x, x));
     arg = vmulq_f32(arg, vmulq_f32(x, c2));
-    float32x4_t exp_arg = ggml_v_expf(arg);
-    float32x4_t gelu = vmulq_f32(x, vdivq_f32(exp_arg, vaddq_f32(exp_arg, one)));
+    // x / (1 + exp(-arg)), not x * exp(arg) / (exp(arg) + 1): with -ffp-model=fast the product x * exp(arg) gets reassociated and goes to inf for x just below 10
+    float32x4_t exp_neg = ggml_v_expf(vnegq_f32(arg));
+    float32x4_t gelu = vdivq_f32(x, vaddq_f32(one, exp_neg));
     uint32x4_t mask = vcgtq_f32(x, vdupq_n_f32(10.f));
     return vbslq_f32(mask, x, gelu);
     //return vreinterpretq_f32_u32(vorrq_u32(vandq_u32(vreinterpretq_u32_f32(x), mask), vbicq_u32(vreinterpretq_u32_f32(gelu), mask)));
@@ -3881,8 +3936,9 @@ inline static __m256 ggml_v_gelu(__m256 x, __m256 c1, __m256 c2) {
     const __m256 mask = _mm256_cmp_ps(x, _mm256_set1_ps(10.f), _CMP_GT_OQ);
     __m256 arg = _mm256_add_ps(one, _mm256_mul_ps(_mm256_mul_ps(x, x), c1));
     arg = _mm256_mul_ps(arg, _mm256_mul_ps(x, c2));
-    __m256 exp_arg = ggml_v_expf(arg);
-    __m256 gelu = _mm256_mul_ps(x, _mm256_div_ps(exp_arg, _mm256_add_ps(exp_arg, one)));
+    // x / (1 + exp(-arg)), not x * exp(arg) / (exp(arg) + 1): with -ffp-model=fast the product x * exp(arg) gets reassociated and goes to inf for x just below 10
+    __m256 exp_neg = ggml_v_expf(_mm256_sub_ps(_mm256_setzero_ps(), arg));
+    __m256 gelu = _mm256_div_ps(x, _mm256_add_ps(one, exp_neg));
     return _mm256_or_ps(_mm256_and_ps(mask, x), _mm256_andnot_ps(mask, gelu));
 }
 
@@ -4820,14 +4876,14 @@ static const char * GGML_UNARY_OP_NAME[GGML_UNARY_OP_COUNT] = {
     "ELU",
     "RELU",
     "SIGMOID",
-    "GELU",
+    "GELU_ERF",
     "GELU_QUICK",
     "SILU",
     "HARDSWISH",
     "HARDSIGMOID",
     "SWIGLU",
     "SWIGLU_OAI",
-    "GELU_ERF",
+    "GELU",
     "EXP",
     "SOFTPLUS",
     "SQRT_SOFTPLUS",
@@ -10597,6 +10653,53 @@ struct ggml_tensor * ggml_delta_net(
     result->src[4] = beta;
     result->src[5] = state;
     result->src[6] = saved_steps;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_delta_net_slots(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * pool,
+        struct ggml_tensor  * ids) {
+    GGML_ASSERT(ggml_is_contiguous(q));
+    GGML_ASSERT(ggml_is_contiguous(k));
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32 && beta->type == GGML_TYPE_F32 && pool->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+
+    const int64_t S_k      = q->ne[0];
+    const int64_t n_tokens = q->ne[1];
+    const int64_t H_k      = q->ne[2];
+    const int64_t n_seqs   = q->ne[3];
+    const int64_t S_v = v->ne[0];
+    const int64_t H_v = v->ne[2];
+
+    GGML_ASSERT(k->ne[0] == S_k && k->ne[1] == n_tokens && k->ne[2] == H_k && k->ne[3] == n_seqs);
+    GGML_ASSERT(v->ne[1] == n_tokens && v->ne[3] == n_seqs);
+    GGML_ASSERT(g->ne[0] == n_tokens && g->ne[1] == 1 && g->ne[2] == H_v && g->ne[3] == n_seqs);
+    GGML_ASSERT(beta->ne[0] == 1 && beta->ne[1] == n_tokens && beta->ne[2] == H_v && beta->ne[3] == n_seqs);
+    GGML_ASSERT(H_v % H_k == 0);
+    // pool: one row per state slot, each row the S_v x S_v x H_v state of a sequence; ids: the slot of each sequence
+    GGML_ASSERT(pool->ne[0] == S_v * S_v * H_v && pool->nb[0] == sizeof(float) && pool->ne[2] == 1 && pool->ne[3] == 1);
+    GGML_ASSERT(ids->ne[0] == n_seqs && ggml_nelements(ids) == n_seqs);
+
+    // only the output: the states are read from and written back to their slots in place
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, S_v * H_v * n_tokens * n_seqs);
+
+    result->op     = GGML_OP_DELTA_NET;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = pool;
+    result->src[8] = ids;
+    ggml_set_op_params_i32(result, 1, 1);
 
     return result;
 }
@@ -18349,6 +18452,49 @@ static inline uint32_t simple_gcd(uint32_t a, uint32_t b) {
     return a;
 }
 
+static inline bool ggml_is_trl_type(enum ggml_type type) {
+    return type == GGML_TYPE_TRL2_G || type == GGML_TYPE_TRL3_G || type == GGML_TYPE_TRL2_M || type == GGML_TYPE_TRL3_M;
+}
+
+// TRL weight (ggml-trl.h): src[2] = d and op_params[1..4] = block, GDN reorder (llm_build_lora_mm); without src[2]
+// the input arrives already rotated. wdata: [x~: M x K floats][a band buffer of 64 x K per thread, if needed].
+static void ggml_compute_forward_mul_mat_trl(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    const struct ggml_tensor * d    = dst->src[2];
+    const int ith = params->ith, nth = params->nth;
+    const int64_t K = src0->ne[0], N = src0->ne[1], M = src1->ne[1];
+
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(N % 64 == 0 && K % 256 == 0);
+    GGML_ASSERT(src0->ne[2] * src0->ne[3] == 1 && src1->ne[2] * src1->ne[3] == 1);
+    GGML_ASSERT(src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
+
+    const float * x = (const float *) src1->data;
+    int64_t ldx = src1->nb[1] / sizeof(float);
+    float * work = (float *) params->wdata;
+    if (d != NULL) {
+        const int blk = dst->op_params[1];
+        GGML_ASSERT(blk > 0 && (blk & (blk - 1)) == 0 && K % blk == 0 && d->type == GGML_TYPE_F32);
+        const int64_t nblk = K / blk;
+        for (int64_t i = ith; i < M * nblk; i += nth) {
+            const int64_t c = i / nblk, k0 = (i % nblk) * blk;
+            ggml_trl_rotate(x + c * ldx, (const float *) d->data, blk, dst->op_params[2], dst->op_params[3],
+                            dst->op_params[4], k0, work + c * K + k0);
+        }
+        ggml_barrier(params->shared);
+        x = work;
+        ldx = K;
+        work += M * K;
+    }
+
+    const int64_t nbands = N / 64, b0 = nbands * ith / nth, b1 = nbands * (ith + 1) / nth;
+    ggml_trl_mul_mat_bands(src0->type, (const char *) src0->data + b0 * 64 * src0->nb[1], K, b1 - b0, x, ldx, M,
+                           (float *) dst->data + 64 * b0, dst->nb[1] / sizeof(float), work + ith * 64 * K);
+}
+
 static int ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst,
@@ -18357,6 +18503,11 @@ static int ggml_compute_forward_mul_mat(
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
+
+    if (ggml_is_trl_type(src0->type)) {
+        ggml_compute_forward_mul_mat_trl(params, dst);
+        return node_n;
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -24529,6 +24680,9 @@ static void ggml_compute_forward_delta_net_f32(
     const struct ggml_tensor * src6 = dst->src[6];
     const struct ggml_tensor * src7 = dst->src[7];
 
+    // ggml_delta_net_slots is built only for states that live in a device buffer (delta_net::build_layer_attn_linear_multi)
+    GGML_ASSERT(dst->op_params[1] == 0 && "delta_net with state slots: no CPU implementation");
+
     if (src3->ne[1] != 1) {
         ggml_compute_forward_kda_f32(params->ith, params->nth, dst);
         return;
@@ -29374,7 +29528,11 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                 {
                     const enum ggml_type vec_dot_type = type_traits[node->src[0]->type].vec_dot_type;
 
-                    if (node->src[1]->type != vec_dot_type) {
+                    if (ggml_is_trl_type(node->src[0]->type)) {   // ggml_compute_forward_mul_mat_trl
+                        const int64_t K = node->src[0]->ne[0], M = node->src[1]->ne[1];
+                        cur  = node->src[2] != NULL ? M * K * sizeof(float) : 0;
+                        cur += ggml_trl_needs_work(M) ? n_tasks * 64 * K * sizeof(float) : 0;
+                    } else if (node->src[1]->type != vec_dot_type) {
                         cur = ggml_row_size(vec_dot_type, node->src[1]->ne[0]) * ggml_nrows(node->src[1]);
                         if (node->src[1]->type != GGML_TYPE_F32) {
                             cur += n_tasks*node->src[1]->ne[0]*sizeof(float); // src1->type -> f32 -> vec_dot_type

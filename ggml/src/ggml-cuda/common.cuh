@@ -912,6 +912,7 @@ struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+    cudaEvent_t copy_dst_event = nullptr;   // copy between GPUs: the destination has finished the queued work
     cudaEvent_t compute_event = nullptr;
     bool p2p_enabled = false;
 

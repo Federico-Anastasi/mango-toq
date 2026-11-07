@@ -1,3 +1,5 @@
+#pragma once
+
 #include "server-task.h"
 #include "server-decision.h"
 #include "server-queue.h"
@@ -8,6 +10,8 @@
 #include <cstddef>
 #include <memory>
 #include <vector>
+
+struct slot_disk_cache;
 
 
 
@@ -122,6 +126,10 @@ struct server_slot {
     llama_pos checkpoint_pos = -1;
     bool do_checkpoint = false;
     bool image_just_processed = false;
+
+    // disk cache (server-slot-file.h)
+    uint64_t disk_hash = 0;      // hash of the tokens at the last save or restore
+    int32_t disk_base_pos = -1;  // end of the common prefix to save as the base, -1 = none
 
     // sampling
     llama_token sampled; // in speculative mode, this is the last accepted token
@@ -275,6 +283,9 @@ struct server_context {
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    std::unique_ptr<slot_disk_cache> disk_cache;
+    uint64_t model_fp = 0; // model hash for the state files
+
     server_metrics metrics;
 
     common_chat_templates_ptr chat_templates;
@@ -325,6 +336,8 @@ struct server_context {
     void send_error(const server_slot& slot, const std::string& error, const enum error_type type = ERROR_TYPE_SERVER);
 
     void send_error(const int id_task, const int id_multi, const std::string& error, const enum error_type type = ERROR_TYPE_SERVER, const int32_t n_prompt_tokens = 0, const int32_t n_ctx = 0);
+
+    void send_slot_error(const server_task& task, const std::string& error, const enum error_type type);
 
     // if multimodal is enabled, send an error and return false
     bool check_no_mtmd(const int id_task);

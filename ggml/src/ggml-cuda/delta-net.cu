@@ -43,7 +43,9 @@ __global__ void delta_net_recurrent_f32(
     const int repeat_type,
     const int64_t n_tokens,
     const int64_t n_seqs,
-    size_t vnb1, size_t vnb2, size_t vnb3) {
+    size_t vnb1, size_t vnb2, size_t vnb3,
+    const int32_t * __restrict__ slot_ids,   // when not null: the state of sequence b is row slot_ids[b] of the pool
+    const int64_t slot_stride) {             // floats between two rows of the pool
     constexpr int warps_per_head = HEAD_DIM/WARP_SIZE;
     const int batch_idx = blockIdx.x / (warps_per_head*n_heads);
     const int sub_head_idx  = blockIdx.x % (warps_per_head*n_heads);
@@ -79,13 +81,14 @@ __global__ void delta_net_recurrent_f32(
     const float * v_ptr = v + batch_idx * vnb3 + head_idx * vnb2;
     const float * g_ptr = g + batch_idx * g_stride_batch + head_idx;
     const float * beta_ptr = beta_in + batch_idx * g_stride_batch + head_idx;
-    const float * state_src = state_in + batch_idx * state_batch_stride + state_head_offset;
+    const int64_t state_base = slot_ids ? (int64_t) slot_ids[batch_idx] * slot_stride : batch_idx * state_batch_stride;
+    const float * state_src = state_in + state_base + state_head_offset;
 
     // Output layout: [head_v_dim, num_v_heads, n_seq_tokens, n_seqs]
     // For [dim, head, token, batch]: index = dim + head*S_v + token*S_v*H_v + batch*S_v*H_v*n_tokens
     float * out_base = dst + batch_idx * (HEAD_DIM * n_heads * n_tokens) + head_idx * HEAD_DIM;
     const int64_t out_token_stride = HEAD_DIM * n_heads;  // stride between tokens
-    float * state_dst = state_out + batch_idx * state_batch_stride + state_head_offset;
+    float * state_dst = state_out + state_base + state_head_offset;
 
     // Shared memory for current token's Q, K, V (normalized), and intermediate results
     extern __shared__ float smem[];
@@ -199,6 +202,7 @@ static void delta_net_f32_cuda(
     const int     repeat_type,
     const int64_t n_seqs,
     size_t vnb1, size_t vnb2, size_t vnb3,
+    const int32_t * slot_ids, const int64_t slot_stride,
     const int device_id,
     const int cc, // compute capability (e.g., 890 for SM 8.9, 1200 for SM 12.0)
     cudaStream_t stream) {
@@ -217,19 +221,19 @@ static void delta_net_f32_cuda(
         constexpr int threads_per_block = 256;
         if (head_dim == 64) {
             delta_net_recurrent_f32<64, threads_per_block><<<num_blocks, threads_per_block, smem_size, stream>>>(
-                    q, k, v, g, beta, state_in, dst, state_out, saved_states, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, vnb1, vnb2, vnb3);
+                    q, k, v, g, beta, state_in, dst, state_out, saved_states, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, vnb1, vnb2, vnb3, slot_ids, slot_stride);
         } else {
             delta_net_recurrent_f32<128, threads_per_block><<<num_blocks, threads_per_block, smem_size, stream>>>(
-                    q, k, v, g, beta, state_in, dst, state_out, saved_states, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, vnb1, vnb2, vnb3);
+                    q, k, v, g, beta, state_in, dst, state_out, saved_states, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, vnb1, vnb2, vnb3, slot_ids, slot_stride);
         }
     } else {
         constexpr int threads_per_block = 128;
         if (head_dim == 64) {
             delta_net_recurrent_f32<64, threads_per_block><<<num_blocks, threads_per_block, smem_size, stream>>>(
-                    q, k, v, g, beta, state_in, dst, state_out, saved_states, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, vnb1, vnb2, vnb3);
+                    q, k, v, g, beta, state_in, dst, state_out, saved_states, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, vnb1, vnb2, vnb3, slot_ids, slot_stride);
         } else {
             delta_net_recurrent_f32<128, threads_per_block><<<num_blocks, threads_per_block, smem_size, stream>>>(
-                    q, k, v, g, beta, state_in, dst, state_out, saved_states, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, vnb1, vnb2, vnb3);
+                    q, k, v, g, beta, state_in, dst, state_out, saved_states, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, vnb1, vnb2, vnb3, slot_ids, slot_stride);
         }
     }
 
@@ -267,8 +271,16 @@ void ggml_cuda_op_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     GGML_ASSERT(src3->ne[0] == n_tokens && src3->ne[1] == 1 && src3->ne[2] == n_heads && src3->ne[3] == n_seqs);
     // Beta: [1, n_tokens, n_heads, n_seqs]
     GGML_ASSERT(src4->ne[0] == 1 && src4->ne[1] == n_tokens && src4->ne[2] == n_heads && src4->ne[3] == n_seqs);
-    // State: [head_dim, head_dim*n_heads, 1, n_seqs]
-    GGML_ASSERT(src5->ne[0] == head_dim && src5->ne[1] == head_dim * n_heads && src5->ne[2] == 1 && src5->ne[3] == n_seqs);
+    // State: [head_dim, head_dim*n_heads, 1, n_seqs], or with state slots a pool {head_dim*head_dim*n_heads, n_slots}
+    const bool slots = dst->op_params[1] == 1;
+    const ggml_tensor * ids = dst->src[8];
+    if (slots) {
+        GGML_ASSERT(ids && ids->type == GGML_TYPE_I32 && ggml_nelements(ids) == n_seqs);
+        GGML_ASSERT(src5->ne[0] == head_dim * head_dim * n_heads && src5->nb[0] == sizeof(float));
+        GGML_ASSERT(src6 == nullptr && src7 == nullptr);
+    } else {
+        GGML_ASSERT(src5->ne[0] == head_dim && src5->ne[1] == head_dim * n_heads && src5->ne[2] == 1 && src5->ne[3] == n_seqs);
+    }
 
     // Verify output tensor size
     const int64_t output_size = head_dim * n_tokens * n_heads * n_seqs;
@@ -288,7 +300,7 @@ void ggml_cuda_op_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         GGML_ASSERT(ggml_nelements(src7) == state_size);
     }
 
-    const int64_t expected_size = output_size + state_size;
+    const int64_t expected_size = slots ? output_size : output_size + state_size;
     GGML_ASSERT(ggml_nelements(dst) == expected_size);
 
     GGML_ASSERT(head_dim <= 256);  // Reasonable limit for shared memory
@@ -305,10 +317,11 @@ void ggml_cuda_op_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         (const float *)src4->data,
         (const float *)src5->data,
         (float *)dst->data,
-        src7 ? (float *)src7->data : (float *)dst->data + output_size,
+        slots ? (float *)src5->data : src7 ? (float *)src7->data : (float *)dst->data + output_size,
         src6 ? (float *)src6->data : nullptr,
         head_dim, n_tokens, n_heads, gqa_ratio, repeat_type, n_seqs,
         src2->nb[1]/sizeof(float), src2->nb[2]/sizeof(float), src2->nb[3]/sizeof(float),
+        slots ? (const int32_t *) ids->data : nullptr, slots ? (int64_t) (src5->nb[1] / sizeof(float)) : 0,
         device_id, cc,
         ctx.stream());
 

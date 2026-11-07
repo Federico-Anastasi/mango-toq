@@ -135,14 +135,21 @@ void server_queue::start_loop() {
         LOG_VERBOSE("wait for new task", {});
         {
             std::unique_lock<std::mutex> lock(mutex_tasks);
-            if (queue_tasks.empty()) {
+            const auto ready = [&] {
+                return (!queue_tasks.empty() || !running);
+            };
+            while (queue_tasks.empty()) {
                 if (!running) {
                     LOG_VERBOSE("ending start_loop", {});
                     return;
                 }
-                condition_tasks.wait(lock, [&] {
-                    return (!queue_tasks.empty() || !running);
-                    });
+                if (!callback_idle) {
+                    condition_tasks.wait(lock, ready);
+                } else if (!condition_tasks.wait_for(lock, std::chrono::milliseconds(idle_ms), ready)) {
+                    lock.unlock();
+                    callback_idle();
+                    lock.lock();
+                }
             }
         }
     }

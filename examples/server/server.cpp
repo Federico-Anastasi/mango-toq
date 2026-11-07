@@ -3,6 +3,7 @@
 #include "server-common.h"
 #include "server-chat.h"
 #include "server-cors-proxy.h"
+#include "server-slot-file.h"
 #include "chat.h"
 
 #include "common.h"
@@ -58,6 +59,59 @@ static void llama_log_tee_callback(enum ggml_log_level level, const char * text,
 #include <memory>
 #include <random>
 #include <algorithm>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+
+// A native crash on Windows otherwise leaves nothing in the log: stack with names (DLL exports, PDB if present).
+static void crash_dump_stack(const char * why) {
+    fprintf(stderr, "\n=== crash (%s), thread %lu ===\n", why, GetCurrentThreadId());
+    void * frames[64];
+    const USHORT n = CaptureStackBackTrace(0, 64, frames, nullptr);
+    HANDLE proc = GetCurrentProcess();
+    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+    SymInitialize(proc, nullptr, TRUE);
+    alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 512];
+    SYMBOL_INFO * sym = (SYMBOL_INFO *) buf;
+    for (USHORT i = 0; i < n; ++i) {
+        HMODULE mod = nullptr;
+        char path[MAX_PATH] = "?";
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR) frames[i], &mod);
+        GetModuleFileNameA(mod, path, MAX_PATH);
+        const char * base = strrchr(path, 0x5c) ? strrchr(path, 0x5c) + 1 : path;
+        memset(buf, 0, sizeof(buf));
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen = 511;
+        DWORD64 disp = 0;
+        IMAGEHLP_LINE64 line = { sizeof(IMAGEHLP_LINE64) };
+        DWORD ldisp = 0;
+        if (SymFromAddr(proc, (DWORD64) frames[i], &disp, sym)) {
+            if (SymGetLineFromAddr64(proc, (DWORD64) frames[i], &ldisp, &line)) {
+                fprintf(stderr, "%2u %s!%s+0x%llx (%s:%lu)\n", i, base, sym->Name, (unsigned long long) disp, line.FileName, line.LineNumber);
+            } else {
+                fprintf(stderr, "%2u %s!%s+0x%llx\n", i, base, sym->Name, (unsigned long long) disp);
+            }
+        } else {
+            fprintf(stderr, "%2u %s+0x%llx\n", i, base, (unsigned long long) ((char *) frames[i] - (char *) mod));
+        }
+    }
+    fflush(stderr);
+}
+
+static LONG WINAPI crash_filter(EXCEPTION_POINTERS * ep) {
+    char why[64];
+    snprintf(why, sizeof(why), "exception 0x%08lx", ep->ExceptionRecord->ExceptionCode);
+    crash_dump_stack(why);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void crash_handlers_install() {
+    SetUnhandledExceptionFilter(crash_filter);
+    signal(SIGABRT, [](int) { crash_dump_stack("abort"); });
+}
+#endif
 #include <src/llama-impl.h>
 #ifdef SQLITE3_MODERN_CPP_SUPPORT
 #include <sqlite_modern_cpp.h>
@@ -471,6 +525,9 @@ static void log_prompt(const gpt_params & params_base, const json & body) {
 }
 
 int main(int argc, char ** argv) {
+#ifdef _WIN32
+    crash_handlers_install();
+#endif
 #if SERVER_VERBOSE != 1
     log_disable();
 #endif
@@ -831,7 +888,7 @@ int main(int argc, char ** argv) {
         }
     };
 
-    const auto handle_slots = [&](const httplib::Request &, httplib::Response & res) {
+    const auto handle_slots = [&](const httplib::Request & req, httplib::Response & res) {
         if (!params.endpoint_slots) {
             res_err(res, format_error_response("This server does not support slots endpoint.", ERROR_TYPE_NOT_SUPPORTED));
             return;
@@ -843,6 +900,7 @@ int main(int argc, char ** argv) {
         task.id_multi  = -1;
         task.id_target = -1;
         task.type = SERVER_TASK_TYPE_METRICS;
+        task.data = { {"lite", req.has_param("lite") && req.get_param_value("lite") != "0"} };
 
         ctx_server.queue_results.add_waiting_task_id(task.id);
         ctx_server.queue_tasks.post(std::move(task));
@@ -973,8 +1031,10 @@ int main(int argc, char ** argv) {
             { "filepath", filepath }
         };
 
-        const int id_task = ctx_server.queue_tasks.post(std::move(task));
+        // register as waiting before queueing: an immediate error would otherwise arrive first and be lost
+        const int id_task = task.id = ctx_server.queue_tasks.get_new_id();
         ctx_server.queue_results.add_waiting_task_id(id_task);
+        ctx_server.queue_tasks.post(std::move(task));
 
         server_task_result result = ctx_server.queue_results.recv(id_task);
         ctx_server.queue_results.remove_waiting_task_id(id_task);
@@ -1003,8 +1063,10 @@ int main(int argc, char ** argv) {
             { "filepath", filepath }
         };
 
-        const int id_task = ctx_server.queue_tasks.post(std::move(task));
+        // register as waiting before queueing: an immediate error would otherwise arrive first and be lost
+        const int id_task = task.id = ctx_server.queue_tasks.get_new_id();
         ctx_server.queue_results.add_waiting_task_id(id_task);
+        ctx_server.queue_tasks.post(std::move(task));
 
         server_task_result result = ctx_server.queue_results.recv(id_task);
         ctx_server.queue_results.remove_waiting_task_id(id_task);
@@ -1023,8 +1085,10 @@ int main(int argc, char ** argv) {
             { "id_slot", id_slot },
         };
 
-        const int id_task = ctx_server.queue_tasks.post(std::move(task));
+        // register as waiting before queueing: an immediate error would otherwise arrive first and be lost
+        const int id_task = task.id = ctx_server.queue_tasks.get_new_id();
         ctx_server.queue_results.add_waiting_task_id(id_task);
+        ctx_server.queue_tasks.post(std::move(task));
 
         server_task_result result = ctx_server.queue_results.recv(id_task);
         ctx_server.queue_results.remove_waiting_task_id(id_task);
@@ -1036,7 +1100,31 @@ int main(int argc, char ** argv) {
         }
     };
 
-    const auto handle_slots_action = [&handle_slots_save, &handle_slots_restore, &handle_slots_erase](const httplib::Request & req, httplib::Response & res) {
+    // current state of the slot into the disk cache (--cache-disk), e.g. at app shutdown
+    const auto handle_slots_persist = [&ctx_server](const httplib::Request & /* req */, httplib::Response & res, int id_slot) {
+        server_task task;
+        task.type = SERVER_TASK_TYPE_SLOT_SAVE;
+        task.data = {
+            { "id_slot", id_slot },
+            { "persist", true }
+        };
+
+        // register as waiting before queueing: an immediate error would otherwise arrive first and be lost
+        const int id_task = task.id = ctx_server.queue_tasks.get_new_id();
+        ctx_server.queue_results.add_waiting_task_id(id_task);
+        ctx_server.queue_tasks.post(std::move(task));
+
+        server_task_result result = ctx_server.queue_results.recv(id_task);
+        ctx_server.queue_results.remove_waiting_task_id(id_task);
+
+        if (result.error) {
+            res_err(res, result.data);
+        } else {
+            res.set_content(result.data.dump(), "application/json");
+        }
+    };
+
+    const auto handle_slots_action = [&handle_slots_save, &handle_slots_restore, &handle_slots_erase, &handle_slots_persist](const httplib::Request & req, httplib::Response & res) {
         std::string id_slot_str = req.path_params.at("id_slot");
         int id_slot;
 
@@ -1055,6 +1143,8 @@ int main(int argc, char ** argv) {
             handle_slots_restore(req, res, id_slot);
         } else if (action == "erase") {
             handle_slots_erase(req, res, id_slot);
+        } else if (action == "persist") {
+            handle_slots_persist(req, res, id_slot);
         } else {
             res_err(res, format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
         }
@@ -1125,8 +1215,30 @@ int main(int argc, char ** argv) {
 
 
     // handle completion-like requests (completion, chat, infill)
+    // Reply to the warmup request when the base is already there: no token read (timings.prompt_n = 0)
+    // and no token written, in the form the client asked for (a single stream chunk, or a JSON).
+    const auto warmup_ready_response = [](httplib::Response & res, bool stream, size_t n_base) {
+        SRV_INF("disk cache: warmup, the base of %zu tokens is already on disk\n", n_base);
+        json out = {
+            {"id",      "chatcmpl-warmup"},
+            {"object",  stream ? "chat.completion.chunk" : "chat.completion"},
+            {"created", (int64_t) std::time(nullptr)},
+            {"model",   "warmup"},
+            {"timings", {{"prompt_n", 0}, {"predicted_n", 0}, {"prompt_ms", 0.0}, {"predicted_ms", 0.0}}},
+            {"base_tokens", n_base},
+        };
+        if (stream) {
+            out["choices"] = json::array({{{"index", 0}, {"delta", json::object()}, {"finish_reason", "stop"}}});
+            std::string body = "data: " + out.dump() + "\n\ndata: [DONE]\n\n";
+            res.set_content(body, "text/event-stream");
+        } else {
+            out["choices"] = json::array({{{"index", 0}, {"message", {{"role", "assistant"}, {"content", ""}}}, {"finish_reason", "stop"}}});
+            res_ok(res, out);
+        }
+    };
+
     // we can optionally provide a custom format for partial results and final results
-    const auto handle_completions_impl = [&ctx_server, &params](
+    const auto handle_completions_impl = [&ctx_server, &params, &warmup_ready_response](
         server_task_type type,
         json& data,
         const std::vector<raw_buffer>& files,
@@ -1155,6 +1267,18 @@ int main(int argc, char ** argv) {
                 else {
                     // Everything else, including multimodal completions.
                     inputs = tokenize_input_prompts(llama_get_vocab(ctx_server.ctx), ctx_server.mctx, prompt, true, true);
+                }
+                // Warmup request (X-Mango-Warmup header): it only makes the engine read the common
+                // prefix. If the base is already on disk there is nothing to do: reply at once
+                // without touching the slot (which may hold the conversation to reopen).
+                if (type == SERVER_TASK_TYPE_COMPLETION && json_value(data, "cache_warmup", false) &&
+                    ctx_server.disk_cache && inputs.size() == 1) {
+                    const size_t n_base = ctx_server.disk_cache->base_on_disk(
+                        ctx_server.ctx, json_value(data, "cache_base_text", std::string()), inputs[0]);
+                    if (n_base > 0) {
+                        warmup_ready_response(res, json_value(data, "stream", false), n_base);
+                        return;
+                    }
                 }
                 tasks.reserve(inputs.size());
                 const std::string requested_model_name = json_value(data, "model", std::string());
@@ -1397,6 +1521,9 @@ int main(int argc, char ** argv) {
         auto body = json::parse(req.body);
         std::vector<raw_buffer> files;
         json data = oaicompat_chat_params_parse(body, ctx_server.chat_params, files);
+        if (req.has_header("X-Mango-Warmup")) {
+            data["cache_warmup"] = true;
+        }
         handle_completions_impl(
             SERVER_TASK_TYPE_COMPLETION,
             data,
@@ -2267,8 +2394,8 @@ int main(int argc, char ** argv) {
     // Save & load slots
     svr->Get ("/slots",               handle_slots);
     svr->Get ("/slots/list",          list_slot_prompts);
-    if (!params.slot_save_path.empty()) {
-        // these endpoints rely on slot_save_path existing
+    if (!params.slot_save_path.empty() || !params.cache_disk.empty()) {
+        // these endpoints rely on slot_save_path existing (persist on --cache-disk)
         svr->Post("/slots/:id_slot",  handle_slots_action);
         svr->Get ("/list",            list_saved_prompts);
         svr->Post("/delete_prompt",   delete_saved_prompt);
@@ -2362,6 +2489,9 @@ int main(int argc, char ** argv) {
     SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
 #endif
 
+    if (ctx_server.disk_cache) {
+        ctx_server.queue_tasks.on_idle([&ctx_server]() { ctx_server.disk_cache->autosave(ctx_server); }, 5000);
+    }
     ctx_server.queue_tasks.start_loop();
 
     svr->stop();

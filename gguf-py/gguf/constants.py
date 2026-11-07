@@ -2136,6 +2136,10 @@ class GGMLQuantizationType(IntEnum):
     PTQ1_0    = 143
     PQ2_0_R8  = 160
     PTQ1_0_R8 = 161
+    TRL2_G    = 162   # trellis: 2 bit, gaussian codebook in a table, bands of 64 rows
+    TRL3_G    = 163   # 3 bit, gaussian
+    TRL2_M    = 164   # 2 bit, computed codebook mul1
+    TRL3_M    = 165   # 3 bit, mul1
     IQ4_KS    = 144
     IQ2_KS    = 145
     IQ4_KSS   = 146
@@ -2378,6 +2382,10 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.PTQ1_0      : ( 128,   28),
     GGMLQuantizationType.PQ2_0_R8    : ( 128,   34),
     GGMLQuantizationType.PTQ1_0_R8   : ( 128,   28),
+    GGMLQuantizationType.TRL2_G      : (   4,    1),
+    GGMLQuantizationType.TRL3_G      : (   8,    3),
+    GGMLQuantizationType.TRL2_M      : (   4,    1),
+    GGMLQuantizationType.TRL3_M      : (   8,    3),
     GGMLQuantizationType.IQ4_KS      : ( 256,  136),
     GGMLQuantizationType.IQ2_KS      : ( 256,   70),
     GGMLQuantizationType.IQ4_KSS     : ( 256,  128),
@@ -2450,6 +2458,10 @@ GGML_ROW_META_SIZES: dict[GGMLQuantizationType, int] = {
     GGMLQuantizationType.Q8_K16      : 20,
     GGMLQuantizationType.IQ3_KS_R16  :  4,
     GGMLQuantizationType.IQ4_KS_R16  :  4,
+    GGMLQuantizationType.TRL2_G      :  4,
+    GGMLQuantizationType.TRL3_G      :  4,
+    GGMLQuantizationType.TRL2_M      :  4,
+    GGMLQuantizationType.TRL3_M      :  4,
 }
 
 

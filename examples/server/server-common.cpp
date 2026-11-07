@@ -1,5 +1,7 @@
 #include "server-common.h"
 
+#include <mutex>
+
 #include <algorithm>
 #include <cstdio>
 
@@ -637,6 +639,60 @@ json oaicompat_chat_params_parse(const json& body) {
 
 
 // used by /chat/completions endpoint
+// The text before the first user message (system prompt and tools): the same in every
+// conversation that shares them, the disk cache keeps its state as a base. It is derived
+// by rendering two conversations that differ only in the first user message.
+static std::string chat_base_prefix(const common_chat_templates * tmpls, const common_chat_templates_inputs & inputs) {
+    common_chat_templates_inputs probe = inputs;
+    probe.messages.clear();
+    for (const auto & m : inputs.messages) {
+        if (m.role != "system") {
+            break;
+        }
+        probe.messages.push_back(m);
+    }
+    probe.add_generation_prompt = false;
+
+    // two renders cost ~50 ms each with 20k system tokens: they are redone only when what determines them changes
+    std::string key = std::to_string(probe.enable_thinking) + std::to_string(probe.parallel_tool_calls) + std::to_string((int) probe.tool_choice);
+    for (const auto & m : probe.messages) {
+        key += '' + m.content;
+        for (const auto & p : m.content_parts) {
+            key += '' + p.text;
+        }
+    }
+    for (const auto & t : probe.tools) {
+        key += '' + t.name + '' + t.description + '' + t.parameters;
+    }
+    for (const auto & kv : probe.chat_template_kwargs) {
+        key += '' + kv.first + '=' + kv.second;
+    }
+    static std::mutex cache_mutex;
+    static std::string cache_key, cache_val;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        if (key == cache_key) {
+            return cache_val;
+        }
+    }
+
+    common_chat_msg user;
+    user.role = "user";
+    user.content = "A";
+    probe.messages.push_back(user);
+    const std::string a = common_chat_templates_apply(tmpls, probe).prompt;
+    probe.messages.back().content = "B";
+    const std::string b = common_chat_templates_apply(tmpls, probe).prompt;
+    size_t n = 0;
+    while (n < a.size() && n < b.size() && a[n] == b[n]) {
+        ++n;
+    }
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    cache_key = std::move(key);
+    cache_val = a.substr(0, n);
+    return cache_val;
+}
+
 json oaicompat_chat_params_parse(
     json& body, /* openai api json semantics */
     const server_chat_params& opt,
@@ -861,6 +917,9 @@ json oaicompat_chat_params_parse(
 
     // Apply chat template to the list of messages
     auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
+    if (opt.cache_base) {
+        llama_params["cache_base_text"] = chat_base_prefix(opt.tmpls.get(), inputs);
+    }
 
     /* Append assistant prefilled message */
     if (prefill_assistant_message) {
@@ -1359,7 +1418,7 @@ llama_tokens::const_iterator server_tokens::cend() {
     return tokens.cend();
 }
 
-llama_tokens server_tokens::tokens_data() {
+llama_tokens server_tokens::tokens_data() const {
     return tokens;
 }
 

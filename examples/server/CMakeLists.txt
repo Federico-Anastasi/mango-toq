@@ -24,6 +24,8 @@ set(TARGET_SRCS
     server-decision.h
     server-context.cpp
     server-context.h
+    server-slot-file.cpp
+    server-slot-file.h
 )
 set(PUBLIC_ASSETS
     index.html.gz
@@ -81,6 +83,8 @@ target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 #target_link_libraries(${TARGET} PRIVATE common ${CMAKE_THREAD_LIBS_INIT})
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)
+# xxhash (header only) for the hash of the state files
+target_include_directories(${TARGET} PRIVATE ../gguf-hash/deps)
 target_link_libraries(${TARGET} PRIVATE common mtmd cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
 
 if (LLAMA_SERVER_SSL)

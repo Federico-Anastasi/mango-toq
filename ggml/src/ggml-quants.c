@@ -15933,6 +15933,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_IQ2_KT: break;
         case GGML_TYPE_IQ3_KT: break;
         case GGML_TYPE_IQ4_KT: break;
+        case GGML_TYPE_TRL2_G: break;
+        case GGML_TYPE_TRL3_G: break;
+        case GGML_TYPE_TRL2_M: break;
+        case GGML_TYPE_TRL3_M: break;
         case GGML_TYPE_Q1_0_G128: break;
         case GGML_TYPE_IQ3_K: break;
         case GGML_TYPE_IQ3_KS: break;
@@ -16559,3 +16563,251 @@ void ggml_gemm_pq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void 
         }
     }
 }
+
+
+// ---------------------------------------------------------------- TRL (ggml-trl.h)
+#include "ggml-trl.h"
+#include "ggml-trl-cb.h"
+
+static const float trl_gauss_cb[TRL_GAUSS_CB_N] = { TRL_GAUSS_CB_VALUES };
+
+// k = (number of bands) x 64 x K. A caller working band by band (dup_q via ggml_packed_rows) passes 64*K;
+// without knowing K separately it cannot split further: the caller passes whole bands of ONE tensor.
+static void trl_dequant(const uint8_t * band, float * y, int64_t k, int b, int mul1) {
+    GGML_ASSERT(k % TRL_TX == 0);
+    const int64_t K = k / TRL_TX;
+    GGML_ASSERT(K % 256 == 0);
+    const float * s = (const float *) band;
+    const uint32_t * w = (const uint32_t *)(band + 4 * TRL_TX);
+    for (int64_t j = 0; j < K / TRL_G; ++j) {
+        const uint32_t * tw = w + j * 8 * b;
+        for (int t = 0; t < TRL_TILE; ++t) {
+            const uint32_t st = trl_state(tw, t, b);
+            const float v = mul1 ? trl_mul1_value(st) : trl_gauss_cb[st];
+            y[(t >> 2) * K + TRL_G * j + (t & 3)] = s[t >> 2] * v;
+        }
+    }
+}
+
+void dequantize_row_trl2_g(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) { trl_dequant(x, y, k, 2, 0); }
+void dequantize_row_trl3_g(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) { trl_dequant(x, y, k, 3, 0); }
+void dequantize_row_trl2_m(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) { trl_dequant(x, y, k, 2, 1); }
+void dequantize_row_trl3_m(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) { trl_dequant(x, y, k, 3, 1); }
+
+// ---------------------------------------------------------------- TRL: product on CPU
+// y = W x~ for whole bands, with x~ already rotated (ggml_trl_rotate). Few columns (decode): the tile is decoded
+// and multiplied at once. Many columns (prefill): the band is decoded to fp32 and the product is done by
+// iqk's fp32 GEMM. The mul1 codebook stays the integer S - 510 up to the row scale, which also carries 1/std.
+
+static inline int trl_type_bits(enum ggml_type type) {
+    return type == GGML_TYPE_TRL3_G || type == GGML_TYPE_TRL3_M ? 3 : 2;
+}
+
+static inline int trl_type_mul1(enum ggml_type type) {
+    return type == GGML_TYPE_TRL2_M || type == GGML_TYPE_TRL3_M;
+}
+
+void ggml_trl_rotate(const float * x, const float * d, int blk, int hd, int nk, int rep, int64_t k0, float * y) {
+    for (int o = 0; o < blk; ++o) {
+        const int64_t gi = k0 + o;
+        int64_t src = gi;
+        if (rep > 1) {          // V heads: from the tiled order [hd, nk, rep] to the HF one [hd, rep, nk]
+            const int64_t hdi = gi % hd, t = gi / hd, repi = t % rep, nki = t / rep;
+            src = hdi + hd * (nki + nk * repi);
+        }
+        y[o] = x[src] * d[gi];
+    }
+    for (int h = 1; h < blk; h <<= 1) {
+        for (int i = 0; i < blk; i += 2 * h) {
+            for (int j = i; j < i + h; ++j) {
+                const float a = y[j], b = y[j + h];
+                y[j]     = a + b;
+                y[j + h] = a - b;
+            }
+        }
+    }
+    const float scale = 1.0f / sqrtf((float) blk);
+    for (int o = 0; o < blk; ++o) {
+        y[o] *= scale;
+    }
+}
+
+#if defined(__AVX2__)
+
+int ggml_trl_needs_work(int64_t ncols) {
+    return ncols > GGML_TRL_GEMV_MAX_COLS;
+}
+
+// 8 states of 14 bits -> 8 codebook values without scale (mul1: the integer S - 510)
+static inline __m256 trl_values8(__m256i st, int mul1) {
+    if (mul1) {
+        const __m256i x   = _mm256_mullo_epi32(st, _mm256_set1_epi32((int) TRL_MUL1_K));
+        const __m256i s16 = _mm256_maddubs_epi16(x, _mm256_set1_epi8(1));
+        const __m256i s32 = _mm256_madd_epi16(s16, _mm256_set1_epi16(1));
+        return _mm256_cvtepi32_ps(_mm256_sub_epi32(s32, _mm256_set1_epi32(510)));
+    }
+    return _mm256_i32gather_ps(trl_gauss_cb, st, 4);
+}
+
+// The tile's stream as big-endian bytes after 16 zero bytes: the 32 bits of the stream starting at byte m (also
+// negative: before the tile the stream is zero) are buf[16+m .. 16+m+3] read big-endian.
+static inline void trl_tile_be(const uint32_t * tw, int b, uint8_t * buf) {
+    const __m256i bswap = _mm256_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12,
+                                           3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+    for (int i = 0; i < b; ++i) {
+        _mm256_storeu_si256((__m256i *)(buf + 16 + 32 * i),
+                            _mm256_shuffle_epi8(_mm256_loadu_si256((const __m256i *) tw + i), bswap));
+    }
+}
+
+// Group g = symbols 8g..8g+7 of the tile (rows 2g and 2g+1, columns 0..3). Symbol i ends at bit b(8g+i+1): its
+// 14-bit window is in the 32 bits starting at byte bg-2 (A, shift 16-b(i+1)) or, when that
+// shift would be negative (b = 3, i >= 5), in those starting at byte bg-1 (B, shift 24-b(i+1)).
+// The 8 groups g0..g0+7 go into the 8 lanes: A and B come from two 16-byte loads and one vpshufb.
+static inline void trl_windows8(const uint8_t * buf, int b, int g0, __m256i * A, __m256i * B) {
+    const uint8_t * p = buf + 16 + b * g0 - 2;
+    const __m256i v = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i *) p)),
+                                              _mm_loadu_si128((const __m128i *)(p + 4 * b)), 1);
+    const __m256i ma = b == 2
+        ? _mm256_setr_epi8(3, 2, 1, 0, 5, 4, 3, 2, 7, 6, 5, 4, 9, 8, 7, 6, 3, 2, 1, 0, 5, 4, 3, 2, 7, 6, 5, 4, 9, 8, 7, 6)
+        : _mm256_setr_epi8(3, 2, 1, 0, 6, 5, 4, 3, 9, 8, 7, 6, 12, 11, 10, 9, 3, 2, 1, 0, 6, 5, 4, 3, 9, 8, 7, 6, 12, 11, 10, 9);
+    *A = _mm256_shuffle_epi8(v, ma);
+    *B = b == 2 ? *A
+       : _mm256_shuffle_epi8(v, _mm256_setr_epi8(4, 3, 2, 1, 7, 6, 5, 4, 10, 9, 8, 7, 13, 12, 11, 10,
+                                                 4, 3, 2, 1, 7, 6, 5, 4, 10, 9, 8, 7, 13, 12, 11, 10));
+}
+
+static inline __m256i trl_state8(__m256i A, __m256i B, int b, int i) {
+    const int sa = 16 - b * (i + 1);
+    const __m256i st = sa >= 0 ? _mm256_srli_epi32(A, sa) : _mm256_srli_epi32(B, 24 - b * (i + 1));
+    return _mm256_and_si256(st, _mm256_set1_epi32(TRL_MASK));
+}
+
+// One band for nc <= GGML_TRL_GEMV_MAX_COLS columns: lane l of vector-group gv sums rows 16gv+2l+h.
+static inline void trl_gemv_band(const uint8_t * band, int64_t K, int b, int mul1, const float * x, int64_t ldx,
+                                 int nc, float * y, int64_t ldy) {
+    const float * s = (const float *) band;
+    const uint32_t * w = (const uint32_t *)(band + 4 * TRL_TX);
+    __m256 acc[GGML_TRL_GEMV_MAX_COLS][4][2];
+    for (int c = 0; c < nc; ++c) {
+        for (int gv = 0; gv < 4; ++gv) {
+            acc[c][gv][0] = acc[c][gv][1] = _mm256_setzero_ps();
+        }
+    }
+    uint8_t buf[16 + 96 + 16] = {0};
+    for (int64_t j = 0; j < K / TRL_G; ++j) {
+        trl_tile_be(w + j * 8 * b, b, buf);
+        for (int gv = 0; gv < 4; ++gv) {
+            __m256i A, B;
+            trl_windows8(buf, b, 8 * gv, &A, &B);
+            __m256 v[8];
+            for (int i = 0; i < 8; ++i) {
+                v[i] = trl_values8(trl_state8(A, B, b, i), mul1);
+            }
+            for (int c = 0; c < nc; ++c) {
+                const float * xc = x + c * ldx + TRL_G * j;
+                for (int h = 0; h < 2; ++h) {
+                    __m256 a = acc[c][gv][h];
+                    for (int i = 0; i < 4; ++i) {
+                        a = _mm256_fmadd_ps(v[4 * h + i], _mm256_broadcast_ss(xc + i), a);
+                    }
+                    acc[c][gv][h] = a;
+                }
+            }
+        }
+    }
+    const float f = mul1 ? 1.0f / TRL_MUL1_STD : 1.0f;
+    for (int c = 0; c < nc; ++c) {
+        for (int gv = 0; gv < 4; ++gv) {
+            for (int h = 0; h < 2; ++h) {
+                float t[8];
+                _mm256_storeu_ps(t, acc[c][gv][h]);
+                for (int l = 0; l < 8; ++l) {
+                    const int r = 16 * gv + 2 * l + h;
+                    y[c * ldy + r] = t[l] * s[r] * f;
+                }
+            }
+        }
+    }
+}
+
+// One band in fp32 [64][K] without the row scale (mul1: the integers S - 510).
+static void trl_dequant_band_unscaled(const uint8_t * band, int64_t K, int b, int mul1, float * y) {
+    const uint32_t * w = (const uint32_t *)(band + 4 * TRL_TX);
+    uint8_t buf[16 + 96 + 16] = {0};
+    for (int64_t j = 0; j < K / TRL_G; ++j) {
+        trl_tile_be(w + j * 8 * b, b, buf);
+        for (int gv = 0; gv < 4; ++gv) {
+            __m256i A, B;
+            trl_windows8(buf, b, 8 * gv, &A, &B);
+            for (int h = 0; h < 2; ++h) {
+                // lane l, symbols 4h..4h+3 -> row 16gv+2l+h, columns 4j..4j+3: 4x4 transpose in each half of the register
+                const __m256 v0 = trl_values8(trl_state8(A, B, b, 4 * h + 0), mul1);
+                const __m256 v1 = trl_values8(trl_state8(A, B, b, 4 * h + 1), mul1);
+                const __m256 v2 = trl_values8(trl_state8(A, B, b, 4 * h + 2), mul1);
+                const __m256 v3 = trl_values8(trl_state8(A, B, b, 4 * h + 3), mul1);
+                const __m256 t0 = _mm256_unpacklo_ps(v0, v1), t1 = _mm256_unpackhi_ps(v0, v1);
+                const __m256 t2 = _mm256_unpacklo_ps(v2, v3), t3 = _mm256_unpackhi_ps(v2, v3);
+                const __m256 r[4] = { _mm256_shuffle_ps(t0, t2, 0x44), _mm256_shuffle_ps(t0, t2, 0xEE),
+                                      _mm256_shuffle_ps(t1, t3, 0x44), _mm256_shuffle_ps(t1, t3, 0xEE) };
+                for (int l = 0; l < 4; ++l) {
+                    _mm_storeu_ps(y + (16 * gv + 2 * l + h) * K + TRL_G * j, _mm256_castps256_ps128(r[l]));
+                    _mm_storeu_ps(y + (16 * gv + 2 * (l + 4) + h) * K + TRL_G * j, _mm256_extractf128_ps(r[l], 1));
+                }
+            }
+        }
+    }
+}
+
+void ggml_trl_mul_mat_bands(enum ggml_type type, const void * w, int64_t K, int64_t nbands, const float * x,
+                            int64_t ldx, int64_t ncols, float * y, int64_t ldy, float * work) {
+    const int b = trl_type_bits(type), mul1 = trl_type_mul1(type);
+    const int64_t band_bytes = trl_band_bytes(K, b);
+    const float f = mul1 ? 1.0f / TRL_MUL1_STD : 1.0f;
+    for (int64_t ib = 0; ib < nbands; ++ib) {
+        const uint8_t * band = (const uint8_t *) w + ib * band_bytes;
+        float * yb = y + TRL_TX * ib;
+        if (ncols <= GGML_TRL_GEMV_MAX_COLS) {
+            trl_gemv_band(band, K, b, mul1, x, ldx, (int) ncols, yb, ldy);
+            continue;
+        }
+        trl_dequant_band_unscaled(band, K, b, mul1, work);
+        const bool ok = iqk_mul_mat(TRL_TX, ncols, K, GGML_TYPE_F32, work, K * sizeof(float), GGML_TYPE_F32, x,
+                                    ldx * sizeof(float), yb, ldy, 0, 1);
+        GGML_ASSERT(ok);
+        const float * s = (const float *) band;
+        for (int64_t c = 0; c < ncols; ++c) {
+            for (int r = 0; r < TRL_TX; ++r) {
+                yb[c * ldy + r] *= s[r] * f;
+            }
+        }
+    }
+}
+
+#else
+
+int ggml_trl_needs_work(int64_t ncols) {
+    GGML_UNUSED(ncols);
+    return 1;
+}
+
+// Without AVX2: the reference band decode and scalar products.
+void ggml_trl_mul_mat_bands(enum ggml_type type, const void * w, int64_t K, int64_t nbands, const float * x,
+                            int64_t ldx, int64_t ncols, float * y, int64_t ldy, float * work) {
+    const int b = trl_type_bits(type), mul1 = trl_type_mul1(type);
+    const int64_t band_bytes = trl_band_bytes(K, b);
+    for (int64_t ib = 0; ib < nbands; ++ib) {
+        trl_dequant((const uint8_t *) w + ib * band_bytes, work, TRL_TX * K, b, mul1);
+        for (int64_t c = 0; c < ncols; ++c) {
+            for (int r = 0; r < TRL_TX; ++r) {
+                float sum = 0.0f;
+                for (int64_t k = 0; k < K; ++k) {
+                    sum += work[r * K + k] * x[c * ldx + k];
+                }
+                y[c * ldy + TRL_TX * ib + r] = sum;
+            }
+        }
+    }
+}
+
+#endif

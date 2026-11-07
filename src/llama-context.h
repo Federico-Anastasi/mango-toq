@@ -155,6 +155,9 @@ struct llama_kv_cache {
 
     std::vector<struct ggml_context *> ctxs;
     std::vector<ggml_backend_buffer_t> bufs;
+    // copies on the main GPU of the recurrent states of layers on other GPUs (llama_context::prefill_main):
+    // zeroed together with the cache
+    ggml_backend_buffer_t buf_prefill_main = nullptr;
 
     size_t total_size() const {
         size_t size = 0;
@@ -357,6 +360,48 @@ struct llama_context {
     struct llama_cparams        cparams;
     struct llama_sampling       sampling;
     struct llama_kv_cache       kv_self;
+
+    // Prompt prefill entirely on the main GPU (llama_prefill_main_set in llama.cpp): for large batches the
+    // tensors of the layers on other GPUs point to copies (weights in pinned RAM, recurrent states on the main
+    // GPU). Declared after kv_self: the destructor restores the pointers before the cache disappears.
+    struct prefill_main_t {
+        struct swap_t {
+            ggml_tensor * t;
+            void * home_data; ggml_backend_buffer_t home_buf;
+            void * alt_data;  ggml_backend_buffer_t alt_buf;
+        };
+        bool inited = false, active = false;
+        bool need_in = false;                      // states to bring from home to the main GPU (first batch)
+        bool prefetched = false;                   // rank 0 of the next batch is already being copied (slot ring)
+        int  min_tokens = 0;                       // 0 = off
+        std::vector<swap_t> weights, states;       // weights: the large ones point to one of the 2 slots, the small ones to a fixed copy
+        std::vector<std::vector<std::pair<ggml_tensor *, const void *>>> rank_copies;   // per remote layer: large weights and their source in RAM
+        std::vector<int> rank_of_layer;            // layer -> rank among the remote layers with large weights, -1 otherwise
+        std::vector<ggml_backend_buffer_t> hbufs;  // pinned RAM: source of the large weights, one buffer per layer
+                                                   // (WDDM refuses a single pinned allocation of ~4 GB)
+        ggml_backend_buffer_t dbuf = nullptr;      // main GPU: small weights + 2 slots
+        ggml_backend_buffer_t sbuf = nullptr;      // main GPU: recurrent states
+        ggml_backend_t copy_be = nullptr;          // second stream on the main GPU: incoming weights
+        ggml_backend_t state_be = nullptr;         // third stream on the main GPU: incoming and outgoing states
+        std::vector<ggml_backend_t> dev_be;        // one stream for each home GPU of the states
+        ggml_backend_event_t ev_copied[2] = { nullptr, nullptr }, ev_free = nullptr;
+        // per state: transit in pinned RAM and events (in = read from home, sh = arrived, done = layer computed,
+        // out = left the main GPU, home = arrived home)
+        struct state_io_t {
+            void * host = nullptr;
+            ggml_backend_t home_be = nullptr;
+            ggml_backend_event_t in = nullptr, sh = nullptr, done = nullptr, out = nullptr, home = nullptr;
+            bool pend_in = false, out_valid = false, home_valid = false;
+        };
+        std::vector<state_io_t> sio;
+        std::vector<int> state_of_layer;           // layer -> index in states, -1 otherwise
+        ggml_backend_buffer_t stbuf = nullptr;     // pinned transit RAM of the states
+        // LoRA adapters: their tensors on the remote GPUs have a fixed copy on the main one (one buffer per
+        // adapter), swapped in prefill like the small weights; removed when the adapter is freed
+        std::vector<std::pair<const void *, swap_t>> lora_weights;
+        std::vector<std::pair<const void *, ggml_backend_buffer_t>> lora_bufs;
+    } prefill_main;   // resources freed by llama_prefill_main_release (start of ~llama_context)
+
     struct llama_context      * mtp_target_ctx   = nullptr;
     struct llama_control_vector cvec;
 
@@ -674,6 +719,9 @@ struct llama_context {
     struct ggml_tensor * inp_s_mask;      // F32 [1, n_kv]
     struct ggml_tensor * inp_s_seq;       // I32 [n_kv, n_batch]
     struct ggml_tensor * inp_s_seq_qnext; // I32 [1, n_batch]
+    // batch of several sequences, one token each (delta_net::build_layer_attn_linear_multi)
+    struct ggml_tensor * inp_s_slots = nullptr;     // I32 [n_batch]: recurrent-state slot of each token
+    struct ggml_tensor * inp_s_seq_multi = nullptr; // I32 [n_batch, n_batch]: row t = {t, -1, ...} for ssm_conv
     struct ggml_tensor * inp_ple_rows = nullptr; // I32 [ple_n_heads * n_batch], qwen4exp n-gram rows
     struct ggml_tensor * inp_pos_bucket;    // I32 [n_batch|n_kv, n_batch]
     struct ggml_tensor * inp_embd_enc;      // F32 [n_embd, n_outputs_enc]
