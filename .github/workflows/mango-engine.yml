@@ -53,9 +53,10 @@ jobs:
       - uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.variant }}
+          # Only the engine's zips: the workspace also holds the CUDA toolkit archives the setup step downloaded.
           path: |
-            ${{ github.workspace }}/*.zip
-            ${{ github.workspace }}/*.zip.sha256
+            ${{ github.workspace }}/${{ env.NAME }}-win-*.zip
+            ${{ github.workspace }}/${{ env.NAME }}-win-*.zip.sha256
           if-no-files-found: error
 
   publish:
