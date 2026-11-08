@@ -18,9 +18,9 @@ param(
     [Parameter(Mandatory)][ValidateSet("cpu", "vulkan", "cuda-12")][string]$Variant,
     [Parameter(Mandatory)][string]$Out,
     [string]$Zip,
-    # cuda-12 only. By default Pascal (61), Turing (75) and Ampere (86) and the other common ones, with PTX for the last one so newer
-    # GPUs can JIT it.
-    [string]$Archs = "61-real;70-real;75-real;80-real;86-real;89",
+    # cuda-12 only. By default Pascal (61), Turing (75), Ampere (80, 86) and Ada (89), with PTX for the last one so newer
+    # GPUs can JIT it. Not Volta (70, data-center cards): with it ggml.dll goes over 2 GiB, too big for a Windows DLL.
+    [string]$Archs = "61-real;75-real;80-real;86-real;89",
     [int]$Jobs = [Environment]::ProcessorCount,
     [string]$Build
 )
