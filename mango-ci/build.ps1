@@ -104,8 +104,17 @@ New-Item -ItemType Directory -Force -Path $Out | Out-Null
 Copy-Item "$Build\bin\*.dll", "$Build\bin\llama-server.exe" $Out -Force
 
 if ($Zip) {
+    # The sizes go in the log. A file over 2 GiB is too big for a Windows DLL: fewer CUDA architectures are needed.
+    $files = @(Get-ChildItem $Out -File | Sort-Object Length -Descending)
+    $files | ForEach-Object { "{0,14:N0}  {1}" -f $_.Length, $_.Name }
+    $big = @($files | Where-Object { $_.Length -ge 2GB })
+    if ($big) { throw "$($big.Name -join ', ') over 2 GiB: build fewer CUDA architectures (-Archs)" }
     Remove-Item $Zip -ErrorAction SilentlyContinue
-    Compress-Archive -Path "$Out\*" -DestinationPath $Zip
+    # tar.exe (bsdtar, part of Windows) streams the files into the zip: Compress-Archive fails on large ones
+    # ("Stream was too long").
+    # Called directly: through Invoke-Native the dash options reach tar mangled.
+    tar.exe -a -c -f $Zip -C $Out @($files.Name)
+    if ($LASTEXITCODE -ne 0) { throw "tar.exe exited with $LASTEXITCODE" }
     $hash = (Get-FileHash $Zip -Algorithm SHA256).Hash.ToLower()
     # no BOM and LF line ending, like `sha256sum`
     [System.IO.File]::WriteAllText("$Zip.sha256", "$hash  $(Split-Path $Zip -Leaf)`n", (New-Object System.Text.UTF8Encoding($false)))
